@@ -50,7 +50,15 @@ configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler       = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # Google Sheets設定
-GOOGLE_SHEET_ID = os.environ['GOOGLE_SHEET_ID']
+# 環境変数が未設定の場合はスプレッドシート連携を無効化してログのみ出力する
+GOOGLE_SHEET_ID   = os.environ.get('GOOGLE_SHEET_ID', '')
+GOOGLE_CREDENTIALS = os.environ.get('GOOGLE_CREDENTIALS', '')
+SHEETS_ENABLED    = bool(GOOGLE_SHEET_ID and GOOGLE_CREDENTIALS)
+if not SHEETS_ENABLED:
+    logger.warning(
+        'GOOGLE_SHEET_ID または GOOGLE_CREDENTIALS が未設定です。'
+        'スプレッドシートへの保存をスキップしてログに出力します。'
+    )
 GOOGLE_SCOPES   = [
     'https://spreadsheets.google.com/feeds',
     'https://www.googleapis.com/auth/drive',
@@ -138,8 +146,7 @@ user_states: dict = {}
 
 def get_spreadsheet():
     """Google Sheetsへの接続を取得する"""
-    credentials_json = os.environ['GOOGLE_CREDENTIALS']
-    credentials_dict = json.loads(credentials_json)
+    credentials_dict = json.loads(GOOGLE_CREDENTIALS)
     creds = Credentials.from_service_account_info(credentials_dict, scopes=GOOGLE_SCOPES)
     client = gspread.authorize(creds)
     return client.open_by_key(GOOGLE_SHEET_ID)
@@ -166,7 +173,8 @@ def save_report(
     factory_content: str = '',
     memo: str = '',
 ):
-    """日報データをGoogle Sheetsの「日報」シートに保存する"""
+    """日報データをGoogle Sheetsの「日報」シートに保存する。
+    スプレッドシート連携が無効な場合はログに出力してスキップする。"""
     now = datetime.now(JST)
 
     # スプレッドシートの列順:
@@ -185,6 +193,11 @@ def save_report(
         memo,
     ]
 
+    # スプレッドシート連携が無効な場合はログのみ
+    if not SHEETS_ENABLED:
+        logger.info(f'[SHEETS無効] 日報データ: {row}')
+        return
+
     spreadsheet = get_spreadsheet()
     sheet = get_or_create_sheet(
         spreadsheet, '日報',
@@ -196,7 +209,16 @@ def save_report(
 
 
 def register_user(user_id: str, display_name: str) -> str:
-    """ユーザーを「users」シートに登録する。既登録の場合はその旨を返す"""
+    """ユーザーを「users」シートに登録する。既登録の場合はその旨を返す。
+    スプレッドシート連携が無効な場合はログのみ出力する。"""
+    if not SHEETS_ENABLED:
+        logger.info(f'[SHEETS無効] ユーザー登録: {display_name} ({user_id})')
+        return (
+            f'✅ {display_name}さんを登録しました！\n'
+            '毎朝9時と14時に日報リマインダーを送ります📋\n'
+            'ボタンをタップして1〜2分で入力できます。'
+        )
+
     spreadsheet = get_spreadsheet()
     users_sheet = get_or_create_sheet(
         spreadsheet, 'users', ['LINE表示名', 'ユーザーID']
@@ -215,7 +237,12 @@ def register_user(user_id: str, display_name: str) -> str:
 
 
 def get_all_user_ids() -> list[str]:
-    """登録済み全ユーザーのIDリストを取得する"""
+    """登録済み全ユーザーのIDリストを取得する。
+    スプレッドシート連携が無効な場合は空リストを返す。"""
+    if not SHEETS_ENABLED:
+        logger.info('[SHEETS無効] ユーザーIDの取得をスキップ')
+        return []
+
     spreadsheet = get_spreadsheet()
     users_sheet = get_or_create_sheet(
         spreadsheet, 'users', ['LINE表示名', 'ユーザーID']
