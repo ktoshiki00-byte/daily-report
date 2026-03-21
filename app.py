@@ -447,7 +447,7 @@ def index():
     return 'LINE日報ボット稼働中！'
 
 
-@app.route('/callback', methods=['POST'])
+@app.route('/webhook', methods=['POST'])
 def callback():
     """LINE Webhookを受け取るエンドポイント"""
     signature = request.headers.get('X-Line-Signature', '')
