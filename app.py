@@ -1,8 +1,9 @@
+import calendar
 import os
 import json
 import logging
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import gspread
@@ -788,6 +789,121 @@ def _build_report_text(name: str, date_sheet: str, date_label: str) -> str:
 
 
 # ─────────────────────────────────────
+# 期間照会ヘルパー
+# ─────────────────────────────────────
+
+def _generate_date_list(start: date, end: date) -> list[str]:
+    """startからendまでの日付リストを'YYYY/MM/DD'形式で返す"""
+    result  = []
+    current = start
+    while current <= end:
+        result.append(current.strftime('%Y/%m/%d'))
+        current += timedelta(days=1)
+    return result
+
+
+def _get_month_dates(year: int, month: int) -> tuple[list[str], str]:
+    """指定年月のすべての日付リストとラベルを返す"""
+    _, last_day = calendar.monthrange(year, month)
+    first = date(year, month, 1)
+    last  = date(year, month, last_day)
+    return _generate_date_list(first, last), f'{year}年{month}月'
+
+
+def _get_current_month_dates() -> tuple[list[str], str]:
+    """今月のすべての日付リストとラベルを返す"""
+    today = datetime.now(JST).date()
+    return _get_month_dates(today.year, today.month)
+
+
+def _get_last_month_dates() -> tuple[list[str], str]:
+    """先月のすべての日付リストとラベルを返す"""
+    today = datetime.now(JST)
+    if today.month == 1:
+        year, month = today.year - 1, 12
+    else:
+        year, month = today.year, today.month - 1
+    return _get_month_dates(year, month)
+
+
+def _build_range_report_text(name: str, date_strs: list[str], label: str) -> str:
+    """指定ユーザー・日付リストの日報テキストを返す（複数日対応）"""
+    records      = get_reports_by_date_range(date_strs)
+    user_records = [r for r in records if r.get('ユーザー名') == name]
+
+    lines = [f'{name}さんの日報', label, '']
+
+    if not user_records:
+        lines.append('この期間のデータはありません。')
+        return '\n'.join(lines)
+
+    by_date: dict[str, dict] = {}
+    for rec in user_records:
+        d    = rec.get('日付', '')
+        slot = rec.get('午前or午後', '')
+        if d not in by_date:
+            by_date[d] = {}
+        by_date[d][slot] = rec
+
+    for date_str in date_strs:
+        if date_str not in by_date:
+            continue
+        slots  = by_date[date_str]
+        parts  = date_str.split('/')
+        d_lbl  = f'{int(parts[1])}/{int(parts[2])}'
+        slot_texts = [
+            f'{slot}:{format_action_label(slots[slot])}'
+            for slot in ['午前', '午後'] if slot in slots
+        ]
+        lines.append(f'{d_lbl} {" ".join(slot_texts)}')
+
+    return '\n'.join(lines)
+
+
+def _reply_range_or_select(reply_token: str, user_id: str, date_strs: list[str], label: str):
+    """範囲レポートを管理者には選択UI、一般ユーザーには直接返信する"""
+    if not date_strs:
+        reply_text(reply_token, '対象日付が取得できませんでした。')
+        return
+
+    start_str = date_strs[0].replace('/', '-')   # YYYY/MM/DD → YYYY-MM-DD
+    end_str   = date_strs[-1].replace('/', '-')
+
+    if user_id == LINE_USER_ID:
+        users = get_all_users()
+        items = [
+            QuickReplyItem(
+                action=PostbackAction(
+                    label='全員',
+                    data=f'action=view_range_all&start={start_str}&end={end_str}',
+                    display_text='全員',
+                )
+            )
+        ]
+        for u in users:
+            items.append(QuickReplyItem(
+                action=PostbackAction(
+                    label=u['name'],
+                    data=f'action=view_range_user&start={start_str}&end={end_str}&name={u["name"]}',
+                    display_text=u['name'],
+                )
+            ))
+        quick_reply = QuickReply(items=items)
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).reply_message(ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=[TextMessage(
+                    text=f'{label}の日報を確認するユーザーを選んでください',
+                    quick_reply=quick_reply,
+                )],
+            ))
+    else:
+        display_name = get_display_name(user_id)
+        report_text  = _build_range_report_text(display_name, date_strs, label)
+        reply_text(reply_token, report_text)
+
+
+# ─────────────────────────────────────
 # Flaskルート
 # ─────────────────────────────────────
 
@@ -882,18 +998,32 @@ def handle_message(event):
         if text == '確認':
             quick_reply = QuickReply(items=[
                 QuickReplyItem(
-                    action=DatetimePickerAction(
-                        label='日付を選ぶ',
-                        data='action=date_selected',
-                        mode='date',
+                    action=PostbackAction(
+                        label='1日分',
+                        data='action=view_1day',
+                        display_text='1日分',
                     )
-                )
+                ),
+                QuickReplyItem(
+                    action=PostbackAction(
+                        label='月別',
+                        data='action=view_month_menu',
+                        display_text='月別',
+                    )
+                ),
+                QuickReplyItem(
+                    action=PostbackAction(
+                        label='期間指定',
+                        data='action=view_range_start',
+                        display_text='期間指定',
+                    )
+                ),
             ])
             with ApiClient(configuration) as api_client:
                 MessagingApi(api_client).reply_message(ReplyMessageRequest(
                     reply_token=reply_token,
                     messages=[TextMessage(
-                        text='照会する日付を選んでください',
+                        text='照会方法を選んでください',
                         quick_reply=quick_reply,
                     )],
                 ))
@@ -1077,6 +1207,209 @@ def handle_postback(event):
             d             = datetime.strptime(selected_date, '%Y-%m-%d')
             date_label    = f'{d.month}月{d.day}日'
             report_text   = _build_report_text(name, date_sheet, date_label)
+            reply_text(reply_token, report_text)
+            return
+
+        # ──── 日報照会：1日分（日付ピッカー表示） ────
+        if action == 'view_1day':
+            quick_reply = QuickReply(items=[
+                QuickReplyItem(
+                    action=DatetimePickerAction(
+                        label='日付を選ぶ',
+                        data='action=date_selected',
+                        mode='date',
+                    )
+                )
+            ])
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message(ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[TextMessage(
+                        text='照会する日付を選んでください',
+                        quick_reply=quick_reply,
+                    )],
+                ))
+            return
+
+        # ──── 日報照会：月別メニュー表示 ────
+        if action == 'view_month_menu':
+            quick_reply = QuickReply(items=[
+                QuickReplyItem(
+                    action=PostbackAction(
+                        label='今月',
+                        data='action=month_view&period=current',
+                        display_text='今月',
+                    )
+                ),
+                QuickReplyItem(
+                    action=PostbackAction(
+                        label='先月',
+                        data='action=month_view&period=last',
+                        display_text='先月',
+                    )
+                ),
+                QuickReplyItem(
+                    action=DatetimePickerAction(
+                        label='月を入力',
+                        data='action=month_input_selected',
+                        mode='date',
+                    )
+                ),
+            ])
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message(ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[TextMessage(
+                        text='期間を選んでください',
+                        quick_reply=quick_reply,
+                    )],
+                ))
+            return
+
+        # ──── 日報照会：今月 or 先月 ────
+        if action == 'month_view':
+            period = data_params.get('period', 'current')
+            if period == 'current':
+                date_strs, label = _get_current_month_dates()
+            else:
+                date_strs, label = _get_last_month_dates()
+            _reply_range_or_select(reply_token, user_id, date_strs, label)
+            return
+
+        # ──── 日報照会：月を入力（日付ピッカーで月選択） ────
+        if action == 'month_input_selected':
+            selected_date = (event.postback.params or {}).get('date', '')
+            if not selected_date:
+                logger.error('month_input_selected: paramsにdateが含まれていません')
+                reply_text(reply_token, '日付の取得に失敗しました。もう一度お試しください。')
+                return
+            d             = datetime.strptime(selected_date, '%Y-%m-%d')
+            date_strs, label = _get_month_dates(d.year, d.month)
+            _reply_range_or_select(reply_token, user_id, date_strs, label)
+            return
+
+        # ──── 日報照会：期間指定（開始日ピッカー表示） ────
+        if action == 'view_range_start':
+            quick_reply = QuickReply(items=[
+                QuickReplyItem(
+                    action=DatetimePickerAction(
+                        label='開始日を選ぶ',
+                        data='action=range_start_selected',
+                        mode='date',
+                    )
+                )
+            ])
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message(ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[TextMessage(
+                        text='開始日を選んでください',
+                        quick_reply=quick_reply,
+                    )],
+                ))
+            return
+
+        # ──── 日報照会：開始日選択後（終了日ピッカー表示） ────
+        if action == 'range_start_selected':
+            start_str = (event.postback.params or {}).get('date', '')
+            if not start_str:
+                logger.error('range_start_selected: paramsにdateが含まれていません')
+                reply_text(reply_token, '日付の取得に失敗しました。もう一度お試しください。')
+                return
+            start_d     = datetime.strptime(start_str, '%Y-%m-%d')
+            start_label = f'{start_d.month}月{start_d.day}日'
+            quick_reply = QuickReply(items=[
+                QuickReplyItem(
+                    action=DatetimePickerAction(
+                        label='終了日を選ぶ',
+                        data=f'action=range_end_selected&start={start_str}',
+                        mode='date',
+                    )
+                )
+            ])
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message(ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[TextMessage(
+                        text=f'終了日を選んでください（開始日：{start_label}）',
+                        quick_reply=quick_reply,
+                    )],
+                ))
+            return
+
+        # ──── 日報照会：終了日選択後（レポート生成） ────
+        if action == 'range_end_selected':
+            start_str = data_params.get('start', '')
+            end_str   = (event.postback.params or {}).get('date', '')
+            if not start_str or not end_str:
+                logger.error('range_end_selected: 日付パラメータが不足しています')
+                reply_text(reply_token, '日付の取得に失敗しました。もう一度お試しください。')
+                return
+            start_d = datetime.strptime(start_str, '%Y-%m-%d').date()
+            end_d   = datetime.strptime(end_str,   '%Y-%m-%d').date()
+            if end_d < start_d:
+                reply_text(reply_token, '終了日は開始日より後の日付を選んでください。')
+                return
+            date_strs = _generate_date_list(start_d, end_d)
+            label     = f'{start_d.month}/{start_d.day}〜{end_d.month}/{end_d.day}'
+            _reply_range_or_select(reply_token, user_id, date_strs, label)
+            return
+
+        # ──── 日報照会：管理者が範囲「全員」を選択 ────
+        if action == 'view_range_all':
+            start_str = data_params.get('start', '')
+            end_str   = data_params.get('end', '')
+            start_d   = datetime.strptime(start_str, '%Y-%m-%d').date()
+            end_d     = datetime.strptime(end_str,   '%Y-%m-%d').date()
+            date_strs = _generate_date_list(start_d, end_d)
+            label     = f'{start_d.month}/{start_d.day}〜{end_d.month}/{end_d.day}'
+            users     = get_all_users()
+            if not users:
+                reply_text(reply_token, '登録ユーザーが0名です。')
+                return
+            records = get_reports_by_date_range(date_strs)
+            lines   = [f'{label}の日報一覧\n']
+            for u in users:
+                uname        = u['name']
+                user_records = [r for r in records if r.get('ユーザー名') == uname]
+                lines.append(f'\n{uname}')
+                if not user_records:
+                    lines.append('  データなし')
+                else:
+                    by_date: dict[str, dict] = {}
+                    for rec in user_records:
+                        d    = rec.get('日付', '')
+                        slot = rec.get('午前or午後', '')
+                        if d not in by_date:
+                            by_date[d] = {}
+                        by_date[d][slot] = rec
+                    for date_str in date_strs:
+                        if date_str not in by_date:
+                            continue
+                        slots      = by_date[date_str]
+                        parts      = date_str.split('/')
+                        d_lbl      = f'{int(parts[1])}/{int(parts[2])}'
+                        slot_texts = [
+                            f'{slot}:{format_action_label(slots[slot])}'
+                            for slot in ['午前', '午後'] if slot in slots
+                        ]
+                        lines.append(f'  {d_lbl} {" ".join(slot_texts)}')
+            text = '\n'.join(lines)
+            if len(text) > 4900:
+                text = text[:4900] + '\n...(以下省略)'
+            reply_text(reply_token, text)
+            return
+
+        # ──── 日報照会：管理者が範囲の個人名を選択 ────
+        if action == 'view_range_user':
+            start_str   = data_params.get('start', '')
+            end_str     = data_params.get('end', '')
+            name        = data_params.get('name', '')
+            start_d     = datetime.strptime(start_str, '%Y-%m-%d').date()
+            end_d       = datetime.strptime(end_str,   '%Y-%m-%d').date()
+            date_strs   = _generate_date_list(start_d, end_d)
+            label       = f'{start_d.month}/{start_d.day}〜{end_d.month}/{end_d.day}'
+            report_text = _build_range_report_text(name, date_strs, label)
             reply_text(reply_token, report_text)
             return
 
