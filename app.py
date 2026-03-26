@@ -870,9 +870,5 @@ def handle_postback(event):
 # ─────────────────────────────────────
 
 if __name__ == '__main__':
-    # スケジューラーを起動（循環インポートを避けるためここで遅延インポート）
-    from scheduler import start_scheduler
-    start_scheduler()
-
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
