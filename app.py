@@ -367,13 +367,15 @@ def reply_error(reply_token: str):
 
 def create_flex_message(time_slot: str) -> FlexMessage:
     """日報入力用Flex Messageを作成する"""
-    # 時間帯でヘッダー色とタイトルを変える
+    # 時間帯でヘッダー色・タイトル・サブテキストを変える
     if time_slot == '午前':
         header_color = '#FF8C00'      # オレンジ（朝）
         title        = '☀️ 午前の日報入力'
+        sub_text     = '今の活動を選んでください👇'
     else:
         header_color = '#1565C0'      # ブルー（午後）
         title        = '🌆 午後の日報入力'
+        sub_text     = '今日も一日お疲れ様でした。\n今の活動を選んでください👇'
 
     # ボタンを生成
     # 訪問系アクション（company入力あり）→ primary、それ以外 → secondary
@@ -420,7 +422,7 @@ def create_flex_message(time_slot: str) -> FlexMessage:
             'contents': [
                 {
                     'type': 'text',
-                    'text': '今の活動を選んでください👇',
+                    'text': sub_text,
                     'wrap': True,
                     'color': '#555555',
                     'size': 'sm',
