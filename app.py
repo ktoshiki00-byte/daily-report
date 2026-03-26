@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+from collections import Counter
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -655,6 +656,9 @@ def _send_weekly_report():
 
     DAY_NAMES = ['月', '火', '水', '木', '金']
 
+    # 管理者サマリー用に各ユーザーの集計結果を蓄積する
+    admin_summary_lines: list[str] = []
+
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
 
@@ -676,6 +680,7 @@ def _send_weekly_report():
             # 曜日ごとの行を生成（連続する未入力日はまとめて表示）
             day_lines: list[str]      = []
             missing_streak: list[str] = []
+            submitted_days = 0  # 提出済み日数（管理者サマリー用）
 
             for day_name, date_str in zip(DAY_NAMES, week_date_strs):
                 slots  = user_week.get(date_str, {})
@@ -685,6 +690,7 @@ def _send_weekly_report():
                 if not has_am and not has_pm:
                     missing_streak.append(day_name)
                 else:
+                    submitted_days += 1
                     if missing_streak:
                         day_lines.append(
                             f'{missing_streak[0]}｜未入力' if len(missing_streak) == 1
@@ -708,10 +714,24 @@ def _send_weekly_report():
                 if r.get('ユーザー名') == name and r.get('行動種別') == '商談'
             )
 
+            # 主な活動内容サマリー（アクション種別ごとの件数、多い順）
+            action_counter = Counter(
+                r.get('行動種別', '')
+                for r in week_records
+                if r.get('ユーザー名') == name and r.get('行動種別')
+            )
+            activity_lines = [
+                f'　{ACTION_EMOJI.get(action, "")} {action}：{count}件'
+                for action, count in action_counter.most_common()
+            ]
+            activity_text = '\n'.join(activity_lines) if activity_lines else '　（データなし）'
+
+            # 個人向けメッセージを組み立てる
             message = (
                 f'📅 今週の振り返り（{week_label}）\n{name}さん\n\n'
                 + '\n'.join(day_lines)
                 + f'\n\n今週の商談件数：{negotiation_count}件'
+                + f'\n\n📌 主な活動内容\n{activity_text}'
             )
 
             try:
@@ -722,6 +742,29 @@ def _send_weekly_report():
                 logger.info(f'週次レポート送信完了: {name} ({uid})')
             except Exception as e:
                 logger.error(f'週次レポート送信失敗 ({uid}): {e}')
+
+            # 管理者サマリー用に1行追加
+            admin_summary_lines.append(
+                f'・{name}｜提出{submitted_days}日 商談{negotiation_count}件'
+            )
+
+    # 管理者（LINE_USER_ID）に全体サマリーを送信
+    if LINE_USER_ID and admin_summary_lines:
+        admin_message = (
+            f'📊 今週の週次サマリー（{week_label}）\n\n'
+            + '\n'.join(admin_summary_lines)
+        )
+        try:
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).push_message(PushMessageRequest(
+                    to=LINE_USER_ID,
+                    messages=[TextMessage(text=admin_message)],
+                ))
+            logger.info('週次管理者サマリー送信完了')
+        except Exception as e:
+            logger.error(f'週次管理者サマリー送信失敗: {e}')
+    elif not LINE_USER_ID:
+        logger.warning('LINE_USER_IDが未設定のため週次管理者サマリーをスキップ')
 
 
 # ─────────────────────────────────────
