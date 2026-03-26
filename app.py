@@ -998,7 +998,11 @@ def handle_postback(event):
 
         # ──── 日報照会：日付選択後 ────
         if action == 'date_selected':
-            selected_date = event.postback.params.date   # 'YYYY-MM-DD'
+            selected_date = (event.postback.params or {}).get('date', '')  # 'YYYY-MM-DD'
+            if not selected_date:
+                logger.error('date_selected: paramsにdateが含まれていません')
+                reply_text(reply_token, '日付の取得に失敗しました。もう一度お試しください。')
+                return
             date_sheet    = selected_date.replace('-', '/')  # 'YYYY/MM/DD'
             d             = datetime.strptime(selected_date, '%Y-%m-%d')
             date_label    = f'{d.month}月{d.day}日'
