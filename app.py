@@ -85,22 +85,22 @@ JST = ZoneInfo('Asia/Tokyo')
 
 # 日報ボタンの定義（label: 表示名, value: 記録値）
 ACTIONS = [
-    {'label': '🤝 商談',          'value': '商談'},
-    {'label': '🚗 移動・外出',    'value': '移動・外出'},
-    {'label': '🏢 メーカー訪問',  'value': 'メーカー訪問'},
-    {'label': '🏭 展示会・イベント', 'value': '展示会・イベント'},
-    {'label': '💻 社内作業',      'value': '社内作業'},
-    {'label': '🏗️ 工場対応',     'value': '工場対応'},
+    {'label': '商談',          'value': '商談'},
+    {'label': '移動・外出',    'value': '移動・外出'},
+    {'label': 'メーカー訪問',  'value': 'メーカー訪問'},
+    {'label': '展示会・イベント', 'value': '展示会・イベント'},
+    {'label': '社内作業',      'value': '社内作業'},
+    {'label': '工場対応',      'value': '工場対応'},
 ]
 
 # アクション名に対応する絵文字（週次レポートの表示用）
 ACTION_EMOJI = {
-    '商談':              '🤝',
-    '移動・外出':        '🚗',
-    'メーカー訪問':      '🏢',
-    '展示会・イベント':  '🏭',
-    '社内作業':          '💻',
-    '工場対応':          '🏗️',
+    '商談':              '',
+    '移動・外出':        '',
+    'メーカー訪問':      '',
+    '展示会・イベント':  '',
+    '社内作業':          '',
+    '工場対応':          '',
 }
 
 # アクション名の短縮表示マッピング（レポートで長い名前を簡略化）
@@ -154,11 +154,11 @@ ACTION_FIRST_STATE = {
 
 # 入力待ち状態 → ユーザーへの質問文
 STATE_QUESTION = {
-    'waiting_for_company':        '訪問先の会社名を入力してください🏢',
-    'waiting_for_memo':           '自由メモがあれば入力してください📝\n（スキップする場合は「スキップ」と送信）',
-    'waiting_for_destination':    '移動先・目的地を入力してください🚗',
-    'waiting_for_work_content':   '作業内容を入力してください💻',
-    'waiting_for_factory_content':'対応内容を入力してください🏗️',
+    'waiting_for_company':        '訪問先の会社名を入力してください',
+    'waiting_for_memo':           '自由メモがあれば入力してください\n（スキップする場合は「スキップ」と送信）',
+    'waiting_for_destination':    '移動先・目的地を入力してください',
+    'waiting_for_work_content':   '作業内容を入力してください',
+    'waiting_for_factory_content':'対応内容を入力してください',
 }
 
 # ─────────────────────────────────────
@@ -255,8 +255,8 @@ def register_user(user_id: str, display_name: str) -> str:
     if not SHEETS_ENABLED:
         logger.info(f'[SHEETS無効] ユーザー登録: {display_name} ({user_id})')
         return (
-            f'✅ {display_name}さんを登録しました！\n'
-            '毎日11時55分と18時00分に日報リマインダーを送ります📋\n'
+            f'{display_name}さんを登録しました！\n'
+            '毎日11時55分と18時00分に日報リマインダーを送ります\n'
             'ボタンをタップして1〜2分で入力できます。'
         )
 
@@ -267,12 +267,12 @@ def register_user(user_id: str, display_name: str) -> str:
     records = users_sheet.get_all_records()
 
     if any(r.get('ユーザーID') == user_id for r in records):
-        return f'✅ {display_name}さんはすでに登録済みです！'
+        return f'{display_name}さんはすでに登録済みです！'
 
     users_sheet.append_row([display_name, user_id])
     return (
-        f'✅ {display_name}さんを登録しました！\n'
-        '毎日11時55分と18時00分に日報リマインダーを送ります📋\n'
+        f'{display_name}さんを登録しました！\n'
+        '毎日11時55分と18時00分に日報リマインダーを送ります\n'
         'ボタンをタップして1〜2分で入力できます。'
     )
 
@@ -361,7 +361,7 @@ def reply_text(reply_token: str, text: str):
 def reply_error(reply_token: str):
     """エラー時に汎用メッセージを返信する"""
     try:
-        reply_text(reply_token, '少し待ってからもう一度お試しください🙏')
+        reply_text(reply_token, '少し待ってからもう一度お試しください')
     except Exception as e:
         logger.error(f'エラー返信にも失敗: {e}')
 
@@ -374,12 +374,12 @@ def create_flex_message(time_slot: str) -> FlexMessage:
     # 時間帯でヘッダー色・タイトル・サブテキストを変える
     if time_slot == '午前':
         header_color = '#FF8C00'      # オレンジ（朝）
-        title        = '☀️ 午前の日報入力'
-        sub_text     = '今の活動を選んでください👇'
+        title        = '午前の日報入力'
+        sub_text     = '今の活動を選んでください'
     else:
         header_color = '#1565C0'      # ブルー（午後）
-        title        = '🌆 午後の日報入力'
-        sub_text     = '今日も一日お疲れ様でした。\n今の活動を選んでください👇'
+        title        = '午後の日報入力'
+        sub_text     = '今日も一日お疲れ様でした。\n今の活動を選んでください'
 
     # ボタンを生成
     # 訪問系アクション（company入力あり）→ primary、それ以外 → secondary
@@ -475,22 +475,22 @@ def send_flex_to_all(time_slot: str):
 def build_summary(state: dict, display_name: str) -> str:
     """記録完了時のサマリー文字列を生成する"""
     lines = [
-        '✅ 記録しました！',
+        '記録しました！',
         '━━━━━━━━━━━',
-        f'👤 {display_name}',
-        f'🕐 {state["time_slot"]}',
-        f'📌 {state["action"]}',
+        f'{display_name}',
+        f'{state["time_slot"]}',
+        f'{state["action"]}',
     ]
     if state.get('company'):
-        lines.append(f'🏢 訪問先: {state["company"]}')
+        lines.append(f'訪問先: {state["company"]}')
     if state.get('destination'):
-        lines.append(f'🚗 移動先: {state["destination"]}')
+        lines.append(f'移動先: {state["destination"]}')
     if state.get('work_content'):
-        lines.append(f'💻 作業内容: {state["work_content"]}')
+        lines.append(f'作業内容: {state["work_content"]}')
     if state.get('factory_content'):
-        lines.append(f'🏗️ 対応内容: {state["factory_content"]}')
+        lines.append(f'対応内容: {state["factory_content"]}')
     if state.get('memo'):
-        lines.append(f'📝 メモ: {state["memo"]}')
+        lines.append(f'メモ: {state["memo"]}')
     return '\n'.join(lines)
 
 # ─────────────────────────────────────
@@ -614,8 +614,8 @@ def _send_daily_report():
             not_submitted.append(name)
 
     # メッセージ本文を組み立てる
-    lines = [f'📊 本日の日報レポート（{date_label}）', '']
-    lines.append(f'✅ 提出済み（{len(submitted)}名）')
+    lines = [f'本日の日報レポート（{date_label}）', '']
+    lines.append(f'提出済み（{len(submitted)}名）')
     for name, slots in submitted:
         parts = [
             f'{slot}:{format_action_label(slots[slot])}'
@@ -623,7 +623,7 @@ def _send_daily_report():
         ]
         lines.append(f'・{name}｜{" ".join(parts)}')
     lines.append('')
-    lines.append(f'❌ 未提出（{len(not_submitted)}名）')
+    lines.append(f'未提出（{len(not_submitted)}名）')
     for name in not_submitted:
         lines.append(f'・{name}')
 
@@ -727,17 +727,17 @@ def _send_weekly_report():
                 if r.get('ユーザー名') == name and r.get('行動種別')
             )
             activity_lines = [
-                f'　{ACTION_EMOJI.get(action, "")} {action}：{count}件'
+                f'　{action}：{count}件'
                 for action, count in action_counter.most_common()
             ]
             activity_text = '\n'.join(activity_lines) if activity_lines else '　（データなし）'
 
             # 個人向けメッセージを組み立てる
             message = (
-                f'📅 今週の振り返り（{week_label}）\n{name}さん\n\n'
+                f'今週の振り返り（{week_label}）\n{name}さん\n\n'
                 + '\n'.join(day_lines)
                 + f'\n\n今週の商談件数：{negotiation_count}件'
-                + f'\n\n📌 主な活動内容\n{activity_text}'
+                + f'\n\n主な活動内容\n{activity_text}'
             )
 
             try:
@@ -757,7 +757,7 @@ def _send_weekly_report():
     # 管理者（LINE_USER_ID）に全体サマリーを送信
     if LINE_USER_ID and admin_summary_lines:
         admin_message = (
-            f'📊 今週の週次サマリー（{week_label}）\n\n'
+            f'今週の週次サマリー（{week_label}）\n\n'
             + '\n'.join(admin_summary_lines)
         )
         try:
@@ -1085,7 +1085,7 @@ def handle_postback(event):
         first_state = ACTION_FIRST_STATE.get(action)
         if not first_state:
             logger.warning(f'未定義のアクション: {action}')
-            reply_text(reply_token, '少し待ってからもう一度お試しください🙏')
+            reply_text(reply_token, '少し待ってからもう一度お試しください')
             return
 
         # ユーザー状態を初期化

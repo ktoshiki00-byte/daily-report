@@ -147,9 +147,9 @@ def monthly_report():
                 )
 
                 message = (
-                    f'📊 先月の実績（{month_label}）\n{name}さん\n\n'
-                    f'📅 提出日数：{submitted_days}日 / {total_days}日（{rate:.0f}%）\n'
-                    f'📌 主な活動TOP3\n{top3_text}'
+                    f'先月の実績（{month_label}）\n{name}さん\n\n'
+                    f'提出日数：{submitted_days}日 / {total_days}日（{rate:.0f}%）\n'
+                    f'主な活動TOP3\n{top3_text}'
                 )
 
                 print(f'[DEBUG] sending to {name} ({uid}) submitted={submitted_days}/{total_days} rate={rate:.0f}%')
@@ -171,9 +171,9 @@ def monthly_report():
                 '\n'.join(alert_users) if alert_users else '　（全員80%以上）'
             )
             admin_message = (
-                f'📊 先月の全体レポート（{month_label}）\n\n'
+                f'先月の全体レポート（{month_label}）\n\n'
                 f'全体提出率：{overall_rate:.0f}%（{len(users)}名）\n\n'
-                f'⚠️ 要注意（80%未満）\n{alert_section}'
+                f'要注意（80%未満）\n{alert_section}'
             )
             print(f'[DEBUG] sending admin report to {LINE_USER_ID}')
             try:
