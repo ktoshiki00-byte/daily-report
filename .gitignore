@@ -1,0 +1,23 @@
+# 環境変数（シークレットキーを含むため必ずGit管理外にする）
+.env
+
+# デバッグログ
+app_debug.log
+
+# Pythonキャッシュ
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 仮想環境
+.venv/
+venv/
+env/
+
+# IDEの設定ファイル
+.vscode/
+.idea/
+
+# OS生成ファイル
+.DS_Store
+Thumbs.db

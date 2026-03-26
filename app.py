@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import gspread
@@ -43,6 +43,10 @@ logger = logging.getLogger(__name__)
 # Flaskアプリ初期化
 app = Flask(__name__)
 
+# Blueprintの登録
+from routes.monthly import monthly_bp   # noqa: E402（循環インポート回避のためここで import）
+app.register_blueprint(monthly_bp)
+
 # LINE Bot設定
 LINE_CHANNEL_SECRET      = os.environ['LINE_CHANNEL_SECRET']
 LINE_CHANNEL_ACCESS_TOKEN = os.environ['LINE_CHANNEL_ACCESS_TOKEN']
@@ -64,6 +68,9 @@ GOOGLE_SCOPES   = [
     'https://www.googleapis.com/auth/drive',
 ]
 
+# 管理者LINE User ID（日報レポート送信先）
+LINE_USER_ID = os.environ.get('LINE_USER_ID', '')
+
 # タイムゾーン（日本標準時）
 JST = ZoneInfo('Asia/Tokyo')
 
@@ -80,6 +87,22 @@ ACTIONS = [
     {'label': '💻 社内作業',      'value': '社内作業'},
     {'label': '🏗️ 工場対応',     'value': '工場対応'},
 ]
+
+# アクション名に対応する絵文字（週次レポートの表示用）
+ACTION_EMOJI = {
+    '商談':              '🤝',
+    '移動・外出':        '🚗',
+    'メーカー訪問':      '🏢',
+    '展示会・イベント':  '🏭',
+    '社内作業':          '💻',
+    '工場対応':          '🏗️',
+}
+
+# アクション名の短縮表示マッピング（レポートで長い名前を簡略化）
+ACTION_SHORT = {
+    '移動・外出':        '移動',
+    '展示会・イベント':  '展示会',
+}
 
 # 各アクションに対応する「入力待ち状態」と「質問文」の定義
 #
@@ -438,6 +461,216 @@ def finalize_and_save(user_id: str, display_name: str):
     )
 
 # ─────────────────────────────────────
+# レポート用ヘルパー
+# ─────────────────────────────────────
+
+def format_action_label(row: dict, with_emoji: bool = False) -> str:
+    """日報1件をレポート用の短縮テキストに変換する。
+    例: 商談 + 丸善商事 → '商談/丸善商事'、with_emoji=True なら '🤝商談/丸善商事'"""
+    action      = row.get('行動種別', '')
+    company     = row.get('訪問先会社名', '').strip()
+    destination = row.get('移動先', '').strip()
+
+    emoji = ACTION_EMOJI.get(action, '') if with_emoji else ''
+    short = ACTION_SHORT.get(action, action)   # 短縮名があれば使う
+
+    if company:
+        return f'{emoji}{short}/{company}'
+    if destination:
+        return f'{emoji}{short}/{destination}'
+    return f'{emoji}{short}'
+
+
+def get_all_users() -> list[dict]:
+    """登録済み全ユーザーの名前とIDを辞書リストで返す。
+    スプレッドシート連携が無効な場合は空リストを返す。"""
+    if not SHEETS_ENABLED:
+        logger.info('[SHEETS無効] ユーザー一覧の取得をスキップ')
+        return []
+    spreadsheet = get_spreadsheet()
+    users_sheet = get_or_create_sheet(
+        spreadsheet, 'users', ['LINE表示名', 'ユーザーID']
+    )
+    records = users_sheet.get_all_records()
+    return [
+        {'name': r['LINE表示名'], 'id': r['ユーザーID']}
+        for r in records
+        if r.get('ユーザーID')
+    ]
+
+
+def get_reports_by_date_range(date_strs: list[str]) -> list[dict]:
+    """指定した日付リストに一致する日報レコードをすべて返す。
+    スプレッドシート連携が無効な場合は空リストを返す。"""
+    if not SHEETS_ENABLED:
+        return []
+    spreadsheet = get_spreadsheet()
+    report_sheet = get_or_create_sheet(
+        spreadsheet, '日報',
+        ['日付', '時間', 'ユーザー名', '午前or午後', '行動種別',
+         '訪問先会社名', '移動先', '作業内容', '工場対応内容', '自由メモ']
+    )
+    all_records = report_sheet.get_all_records()
+    date_set = set(date_strs)
+    return [r for r in all_records if r.get('日付') in date_set]
+
+
+def _send_daily_report():
+    """日報レポートを管理者に送信するコア処理。
+    スプレッドシートまたはLINE_USER_IDが未設定の場合はスキップする。
+    ビュー関数（/report）とスケジューラーの両方から呼び出せる。"""
+    if not SHEETS_ENABLED:
+        logger.info('日報レポートをスキップ（スプレッドシート未設定）')
+        return
+    if not LINE_USER_ID:
+        logger.info('日報レポートをスキップ（LINE_USER_ID未設定）')
+        return
+
+    today      = datetime.now(JST)
+    today_str  = today.strftime('%Y/%m/%d')
+    date_label = f'{today.month}月{today.day}日'
+
+    # 全ユーザーと今日の日報を取得
+    users         = get_all_users()
+    today_records = get_reports_by_date_range([today_str])
+
+    # ユーザー名をキーに午前・午後の最新エントリをまとめる（同一時間帯は後勝ち）
+    user_report_map: dict[str, dict] = {}
+    for record in today_records:
+        name = record.get('ユーザー名', '')
+        slot = record.get('午前or午後', '')
+        if name not in user_report_map:
+            user_report_map[name] = {}
+        user_report_map[name][slot] = record
+
+    # 提出済み・未提出に分類
+    submitted, not_submitted = [], []
+    for user in users:
+        name = user['name']
+        if name in user_report_map:
+            submitted.append((name, user_report_map[name]))
+        else:
+            not_submitted.append(name)
+
+    # メッセージ本文を組み立てる
+    lines = [f'📊 本日の日報レポート（{date_label}）', '']
+    lines.append(f'✅ 提出済み（{len(submitted)}名）')
+    for name, slots in submitted:
+        parts = [
+            f'{slot}:{format_action_label(slots[slot])}'
+            for slot in ['午前', '午後'] if slot in slots
+        ]
+        lines.append(f'・{name}｜{" ".join(parts)}')
+    lines.append('')
+    lines.append(f'❌ 未提出（{len(not_submitted)}名）')
+    for name in not_submitted:
+        lines.append(f'・{name}')
+
+    # 管理者に送信
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).push_message(PushMessageRequest(
+            to=LINE_USER_ID,
+            messages=[TextMessage(text='\n'.join(lines))],
+        ))
+    logger.info('日報レポート送信完了')
+
+
+def _send_weekly_report():
+    """週次振り返りレポートを全登録ユーザーに個別送信するコア処理。
+    ビュー関数（/weekly）とスケジューラーの両方から呼び出せる。"""
+    if not SHEETS_ENABLED:
+        logger.info('週次レポートをスキップ（スプレッドシート未設定）')
+        return
+
+    today  = datetime.now(JST)
+    # 今週の月曜日を算出
+    monday = today - timedelta(days=today.weekday())
+    week_dates     = [monday + timedelta(days=i) for i in range(5)]
+    week_date_strs = [d.strftime('%Y/%m/%d') for d in week_dates]
+    week_label = (
+        f'{monday.month}/{monday.day}〜'
+        f'{week_dates[-1].month}/{week_dates[-1].day}'
+    )
+
+    users        = get_all_users()
+    week_records = get_reports_by_date_range(week_date_strs)
+
+    if not users:
+        logger.info('週次レポートをスキップ（登録ユーザーが0名）')
+        return
+
+    DAY_NAMES = ['月', '火', '水', '木', '金']
+
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+
+        for user in users:
+            name = user['name']
+            uid  = user['id']
+
+            # このユーザーの今週分レコードを日付×時間帯で整理（後勝ち）
+            user_week: dict[str, dict] = {}
+            for record in week_records:
+                if record.get('ユーザー名') != name:
+                    continue
+                date = record.get('日付', '')
+                slot = record.get('午前or午後', '')
+                if date not in user_week:
+                    user_week[date] = {}
+                user_week[date][slot] = record
+
+            # 曜日ごとの行を生成（連続する未入力日はまとめて表示）
+            day_lines: list[str]      = []
+            missing_streak: list[str] = []
+
+            for day_name, date_str in zip(DAY_NAMES, week_date_strs):
+                slots  = user_week.get(date_str, {})
+                has_am = '午前' in slots
+                has_pm = '午後' in slots
+
+                if not has_am and not has_pm:
+                    missing_streak.append(day_name)
+                else:
+                    if missing_streak:
+                        day_lines.append(
+                            f'{missing_streak[0]}｜未入力' if len(missing_streak) == 1
+                            else f'{missing_streak[0]}〜{missing_streak[-1]}｜未入力'
+                        )
+                        missing_streak = []
+                    am_text = format_action_label(slots['午前'], with_emoji=True) if has_am else '未入力'
+                    pm_text = format_action_label(slots['午後'], with_emoji=True) if has_pm else '未入力'
+                    day_lines.append(f'{day_name}｜午前:{am_text} 午後:{pm_text}')
+
+            # 末尾に残った連続未入力をまとめて出力
+            if missing_streak:
+                day_lines.append(
+                    f'{missing_streak[0]}｜未入力' if len(missing_streak) == 1
+                    else f'{missing_streak[0]}〜{missing_streak[-1]}｜未入力'
+                )
+
+            # 今週の商談件数を集計
+            negotiation_count = sum(
+                1 for r in week_records
+                if r.get('ユーザー名') == name and r.get('行動種別') == '商談'
+            )
+
+            message = (
+                f'📅 今週の振り返り（{week_label}）\n{name}さん\n\n'
+                + '\n'.join(day_lines)
+                + f'\n\n今週の商談件数：{negotiation_count}件'
+            )
+
+            try:
+                line_bot_api.push_message(PushMessageRequest(
+                    to=uid,
+                    messages=[TextMessage(text=message)],
+                ))
+                logger.info(f'週次レポート送信完了: {name} ({uid})')
+            except Exception as e:
+                logger.error(f'週次レポート送信失敗 ({uid}): {e}')
+
+
+# ─────────────────────────────────────
 # Flaskルート
 # ─────────────────────────────────────
 
@@ -477,6 +710,37 @@ def afternoon():
     logger.info('午後プッシュ開始')
     send_flex_to_all('午後')
     return jsonify({'status': 'ok', 'message': '午後の日報を送信しました'})
+
+
+@app.route('/report', methods=['GET', 'POST'])
+def daily_report():
+    """管理者向け日報レポートをLINE_USER_IDに送信するエンドポイント。
+    コアロジックは _send_daily_report() に集約している。"""
+    if not SHEETS_ENABLED:
+        return jsonify({'status': 'skip', 'message': 'スプレッドシート未設定のためスキップ'})
+    if not LINE_USER_ID:
+        return jsonify({'status': 'skip', 'message': 'LINE_USER_IDが未設定のためスキップ'})
+    try:
+        _send_daily_report()
+        return jsonify({'status': 'ok', 'message': '日報レポートを送信しました'})
+    except Exception as e:
+        logger.error(f'daily_report エラー: {e}')
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/weekly', methods=['GET', 'POST'])
+def weekly_report():
+    """週次振り返りレポートを全登録ユーザーに個別送信するエンドポイント。
+    コアロジックは _send_weekly_report() に集約している。"""
+    if not SHEETS_ENABLED:
+        return jsonify({'status': 'skip', 'message': 'スプレッドシート未設定のためスキップ'})
+    try:
+        _send_weekly_report()
+        return jsonify({'status': 'ok', 'message': '週次レポートを送信しました'})
+    except Exception as e:
+        logger.error(f'weekly_report エラー: {e}')
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
 
 # ─────────────────────────────────────
 # LINEイベントハンドラ
@@ -606,5 +870,9 @@ def handle_postback(event):
 # ─────────────────────────────────────
 
 if __name__ == '__main__':
+    # スケジューラーを起動（循環インポートを避けるためここで遅延インポート）
+    from scheduler import start_scheduler
+    start_scheduler()
+
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
