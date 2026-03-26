@@ -76,9 +76,9 @@ def monthly_report():
     """前月分の日報を集計して各ユーザーと管理者に送信するエンドポイント"""
     # 循環インポート回避のためルート内で遅延インポートする
     from app import (
-        SHEETS_ENABLED, LINE_USER_ID,
+        SHEETS_ENABLED,
         configuration,
-        get_all_users, get_reports_by_date_range,
+        get_all_users, get_reports_by_date_range, get_admin_ids,
     )
 
     if not SHEETS_ENABLED:
@@ -164,8 +164,9 @@ def monthly_report():
                     print(f'[DEBUG] send ERROR ({name}): {e}')
                     logger.error(f'月次レポート送信失敗 ({uid}): {e}')
 
-        # ─── 管理者に全体集計を送信 ───
-        if LINE_USER_ID:
+        # ─── 全管理者に全体集計を送信 ───
+        admin_ids = get_admin_ids()
+        if admin_ids:
             overall_rate  = total_rate_sum / len(users) if users else 0.0
             alert_section = (
                 '\n'.join(alert_users) if alert_users else '　（全員80%以上）'
@@ -175,20 +176,22 @@ def monthly_report():
                 f'全体提出率：{overall_rate:.0f}%（{len(users)}名）\n\n'
                 f'要注意（80%未満）\n{alert_section}'
             )
-            print(f'[DEBUG] sending admin report to {LINE_USER_ID}')
+            print(f'[DEBUG] sending admin report to {len(admin_ids)} admins')
             try:
                 with ApiClient(configuration) as api_client:
-                    result = MessagingApi(api_client).push_message(PushMessageRequest(
-                        to=LINE_USER_ID,
-                        messages=[TextMessage(text=admin_message)],
-                    ))
-                print(f'[DEBUG] admin send OK: {result}')
+                    api = MessagingApi(api_client)
+                    for uid in admin_ids:
+                        result = api.push_message(PushMessageRequest(
+                            to=uid,
+                            messages=[TextMessage(text=admin_message)],
+                        ))
+                        print(f'[DEBUG] admin send OK ({uid}): {result}')
                 logger.info('月次管理者レポート送信完了')
             except Exception as e:
                 print(f'[DEBUG] admin send ERROR: {e}')
                 logger.error(f'月次管理者レポート送信失敗: {e}')
         else:
-            logger.warning('LINE_USER_IDが未設定のため管理者レポートをスキップ')
+            logger.warning('管理者が未登録のため月次管理者レポートをスキップ')
 
         return jsonify({'status': 'ok', 'message': '月次レポートを送信しました'})
 

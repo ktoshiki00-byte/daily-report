@@ -316,18 +316,11 @@ def save_inquiry(display_name: str, message: str, auto_reply: str):
 
 
 def notify_admin_inquiry(display_name: str, message: str):
-    """不明な問い合わせを管理者（LINE_USER_ID）にプッシュ通知する。
-    LINE_USER_IDが未設定の場合はスキップする。"""
-    if not LINE_USER_ID:
-        logger.warning('LINE_USER_IDが未設定のため管理者通知をスキップ')
-        return
+    """不明な問い合わせを全管理者にプッシュ通知する。
+    管理者が未登録の場合はスキップする。"""
     notify_text = f'【問い合わせ】{display_name}さんからメッセージ：{message}'
     try:
-        with ApiClient(configuration) as api_client:
-            MessagingApi(api_client).push_message(PushMessageRequest(
-                to=LINE_USER_ID,
-                messages=[TextMessage(text=notify_text)],
-            ))
+        _push_to_admins(notify_text)
         logger.info(f'管理者への問い合わせ通知完了: {display_name}')
     except Exception as e:
         logger.error(f'管理者通知エラー: {e}')
@@ -577,15 +570,63 @@ def get_reports_by_date_range(date_strs: list[str]) -> list[dict]:
     return [r for r in all_records if r.get('日付') in date_set]
 
 
+def get_admins() -> list[dict]:
+    """管理者シートから全管理者の {id, name} リストを返す。
+    スプレッドシート連携が無効な場合は環境変数 LINE_USER_ID をフォールバックとして使う。"""
+    if not SHEETS_ENABLED:
+        if LINE_USER_ID:
+            return [{'id': LINE_USER_ID, 'name': '管理者'}]
+        return []
+    spreadsheet  = get_spreadsheet()
+    admin_sheet  = get_or_create_sheet(
+        spreadsheet, '管理者', ['LINE_USER_ID', '名前']
+    )
+    records = admin_sheet.get_all_records()
+    return [
+        {'id': r['LINE_USER_ID'], 'name': r.get('名前', '')}
+        for r in records
+        if r.get('LINE_USER_ID')
+    ]
+
+
+def get_admin_ids() -> list[str]:
+    """管理者のLINEユーザーIDリストを返す"""
+    return [a['id'] for a in get_admins()]
+
+
+def is_admin(user_id: str) -> bool:
+    """指定ユーザーが管理者かどうかを返す"""
+    return user_id in get_admin_ids()
+
+
+def _push_to_admins(message: str):
+    """全管理者に同じテキストメッセージをプッシュ送信する"""
+    admin_ids = get_admin_ids()
+    if not admin_ids:
+        logger.warning('管理者が未登録のため送信をスキップ')
+        return
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        for uid in admin_ids:
+            try:
+                api.push_message(PushMessageRequest(
+                    to=uid,
+                    messages=[TextMessage(text=message)],
+                ))
+            except Exception as e:
+                logger.error(f'管理者へのプッシュ失敗 ({uid}): {e}')
+
+
 def _send_daily_report():
-    """日報レポートを管理者に送信するコア処理。
-    スプレッドシートまたはLINE_USER_IDが未設定の場合はスキップする。
+    """日報レポートを全管理者に送信するコア処理。
+    スプレッドシートが無効または管理者未登録の場合はスキップする。
     ビュー関数（/report）とスケジューラーの両方から呼び出せる。"""
     if not SHEETS_ENABLED:
         logger.info('日報レポートをスキップ（スプレッドシート未設定）')
         return
-    if not LINE_USER_ID:
-        logger.info('日報レポートをスキップ（LINE_USER_ID未設定）')
+    admin_ids = get_admin_ids()
+    if not admin_ids:
+        logger.info('日報レポートをスキップ（管理者未登録）')
         return
 
     today      = datetime.now(JST)
@@ -628,12 +669,8 @@ def _send_daily_report():
     for name in not_submitted:
         lines.append(f'・{name}')
 
-    # 管理者に送信
-    with ApiClient(configuration) as api_client:
-        MessagingApi(api_client).push_message(PushMessageRequest(
-            to=LINE_USER_ID,
-            messages=[TextMessage(text='\n'.join(lines))],
-        ))
+    # 全管理者に送信
+    _push_to_admins('\n'.join(lines))
     logger.info('日報レポート送信完了')
 
 
@@ -755,23 +792,17 @@ def _send_weekly_report():
                 f'・{name}｜提出{submitted_days}日 商談{negotiation_count}件'
             )
 
-    # 管理者（LINE_USER_ID）に全体サマリーを送信
-    if LINE_USER_ID and admin_summary_lines:
+    # 全管理者に週次サマリーを送信
+    if admin_summary_lines:
         admin_message = (
             f'今週の週次サマリー（{week_label}）\n\n'
             + '\n'.join(admin_summary_lines)
         )
         try:
-            with ApiClient(configuration) as api_client:
-                MessagingApi(api_client).push_message(PushMessageRequest(
-                    to=LINE_USER_ID,
-                    messages=[TextMessage(text=admin_message)],
-                ))
+            _push_to_admins(admin_message)
             logger.info('週次管理者サマリー送信完了')
         except Exception as e:
             logger.error(f'週次管理者サマリー送信失敗: {e}')
-    elif not LINE_USER_ID:
-        logger.warning('LINE_USER_IDが未設定のため週次管理者サマリーをスキップ')
 
 
 def _build_report_text(name: str, date_sheet: str, date_label: str) -> str:
@@ -869,7 +900,7 @@ def _reply_range_or_select(reply_token: str, user_id: str, date_strs: list[str],
     start_str = date_strs[0].replace('/', '-')   # YYYY/MM/DD → YYYY-MM-DD
     end_str   = date_strs[-1].replace('/', '-')
 
-    if user_id == LINE_USER_ID:
+    if is_admin(user_id):
         users = get_all_users()
         items = [
             QuickReplyItem(
@@ -947,12 +978,10 @@ def afternoon():
 
 @app.route('/report', methods=['GET', 'POST'])
 def daily_report():
-    """管理者向け日報レポートをLINE_USER_IDに送信するエンドポイント。
+    """管理者向け日報レポートを全管理者に送信するエンドポイント。
     コアロジックは _send_daily_report() に集約している。"""
     if not SHEETS_ENABLED:
         return jsonify({'status': 'skip', 'message': 'スプレッドシート未設定のためスキップ'})
-    if not LINE_USER_ID:
-        return jsonify({'status': 'skip', 'message': 'LINE_USER_IDが未設定のためスキップ'})
     try:
         _send_daily_report()
         return jsonify({'status': 'ok', 'message': '日報レポートを送信しました'})
@@ -1137,7 +1166,7 @@ def handle_postback(event):
             d             = datetime.strptime(selected_date, '%Y-%m-%d')
             date_label    = f'{d.month}月{d.day}日'
 
-            if user_id == LINE_USER_ID:
+            if is_admin(user_id):
                 # 管理者: 全員 or 個人名のクイックリプライを表示
                 users = get_all_users()
                 items = [
