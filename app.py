@@ -20,6 +20,10 @@ from linebot.v3.messaging import (
     TextMessage,
     FlexMessage,
     FlexContainer,
+    QuickReply,
+    QuickReplyItem,
+    DatetimePickerAction,
+    PostbackAction,
 )
 from linebot.v3.webhooks import (
     MessageEvent,
@@ -769,6 +773,20 @@ def _send_weekly_report():
         logger.warning('LINE_USER_IDが未設定のため週次管理者サマリーをスキップ')
 
 
+def _build_report_text(name: str, date_sheet: str, date_label: str) -> str:
+    """指定ユーザー・日付の日報テキストを返す。未提出の場合はその旨を返す。"""
+    records = get_reports_by_date_range([date_sheet])
+    user_records = [r for r in records if r.get('ユーザー名') == name]
+    if not user_records:
+        return f'{name}さんの{date_label}の日報\n\n未提出です。'
+    lines = [f'{name}さんの{date_label}の日報\n']
+    for rec in sorted(user_records, key=lambda r: r.get('午前or午後', '')):
+        slot  = rec.get('午前or午後', '')
+        label = format_action_label(rec, with_emoji=True)
+        lines.append(f'{slot}：{label}')
+    return '\n'.join(lines)
+
+
 # ─────────────────────────────────────
 # Flaskルート
 # ─────────────────────────────────────
@@ -858,6 +876,27 @@ def handle_message(event):
             display_name = get_display_name(user_id)
             result_msg   = register_user(user_id, display_name)
             reply_text(reply_token, result_msg)
+            return
+
+        # ──── 確認コマンド（日報照会） ────
+        if text == '確認':
+            quick_reply = QuickReply(items=[
+                QuickReplyItem(
+                    action=DatetimePickerAction(
+                        label='日付を選ぶ',
+                        data='action=date_selected',
+                        mode='date',
+                    )
+                )
+            ])
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message(ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[TextMessage(
+                        text='照会する日付を選んでください',
+                        quick_reply=quick_reply,
+                    )],
+                ))
             return
 
         # ──── ユーザー状態を確認 ────
@@ -953,10 +992,91 @@ def handle_postback(event):
 
     try:
         # ポストバックデータをパース（例: "action=商談&time_slot=午前"）
-        params    = dict(item.split('=', 1) for item in postback_data.split('&'))
-        action    = params.get('action', '')
-        time_slot = params.get('time_slot', '午前')
+        data_params = dict(item.split('=', 1) for item in postback_data.split('&'))
+        action      = data_params.get('action', '')
+        time_slot   = data_params.get('time_slot', '午前')
 
+        # ──── 日報照会：日付選択後 ────
+        if action == 'date_selected':
+            selected_date = event.postback.params.date   # 'YYYY-MM-DD'
+            date_sheet    = selected_date.replace('-', '/')  # 'YYYY/MM/DD'
+            d             = datetime.strptime(selected_date, '%Y-%m-%d')
+            date_label    = f'{d.month}月{d.day}日'
+
+            if user_id == LINE_USER_ID:
+                # 管理者: 全員 or 個人名のクイックリプライを表示
+                users = get_all_users()
+                items = [
+                    QuickReplyItem(
+                        action=PostbackAction(
+                            label='全員',
+                            data=f'action=view_all&date={selected_date}',
+                            display_text='全員',
+                        )
+                    )
+                ]
+                for u in users:
+                    items.append(QuickReplyItem(
+                        action=PostbackAction(
+                            label=u['name'],
+                            data=f'action=view_user&date={selected_date}&name={u["name"]}',
+                            display_text=u['name'],
+                        )
+                    ))
+                quick_reply = QuickReply(items=items)
+                with ApiClient(configuration) as api_client:
+                    MessagingApi(api_client).reply_message(ReplyMessageRequest(
+                        reply_token=reply_token,
+                        messages=[TextMessage(
+                            text=f'{date_label}の日報を確認するユーザーを選んでください',
+                            quick_reply=quick_reply,
+                        )],
+                    ))
+            else:
+                # 一般ユーザー: 自分の日報を表示
+                display_name = get_display_name(user_id)
+                report_text  = _build_report_text(display_name, date_sheet, date_label)
+                reply_text(reply_token, report_text)
+            return
+
+        # ──── 日報照会：管理者が「全員」を選択 ────
+        if action == 'view_all':
+            selected_date = data_params.get('date', '')
+            date_sheet    = selected_date.replace('-', '/')
+            d             = datetime.strptime(selected_date, '%Y-%m-%d')
+            date_label    = f'{d.month}月{d.day}日'
+            users         = get_all_users()
+            if not users:
+                reply_text(reply_token, '登録ユーザーが0名です。')
+                return
+            records = get_reports_by_date_range([date_sheet])
+            lines   = [f'{date_label}の日報一覧\n']
+            for u in users:
+                user_records = [r for r in records if r.get('ユーザー名') == u['name']]
+                if not user_records:
+                    lines.append(f'{u["name"]}：未提出')
+                else:
+                    parts = []
+                    for rec in sorted(user_records, key=lambda r: r.get('午前or午後', '')):
+                        slot  = rec.get('午前or午後', '')
+                        label = format_action_label(rec, with_emoji=True)
+                        parts.append(f'{slot}:{label}')
+                    lines.append(f'{u["name"]}：{" ".join(parts)}')
+            reply_text(reply_token, '\n'.join(lines))
+            return
+
+        # ──── 日報照会：管理者が個人名を選択 ────
+        if action == 'view_user':
+            selected_date = data_params.get('date', '')
+            name          = data_params.get('name', '')
+            date_sheet    = selected_date.replace('-', '/')
+            d             = datetime.strptime(selected_date, '%Y-%m-%d')
+            date_label    = f'{d.month}月{d.day}日'
+            report_text   = _build_report_text(name, date_sheet, date_label)
+            reply_text(reply_token, report_text)
+            return
+
+        # ──── 日報入力ボタン ────
         # アクションに対応する最初の入力待ち状態を取得
         first_state = ACTION_FIRST_STATE.get(action)
         if not first_state:
