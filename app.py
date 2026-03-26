@@ -251,7 +251,7 @@ def register_user(user_id: str, display_name: str) -> str:
         logger.info(f'[SHEETS無効] ユーザー登録: {display_name} ({user_id})')
         return (
             f'✅ {display_name}さんを登録しました！\n'
-            '毎朝9時と14時に日報リマインダーを送ります📋\n'
+            '毎日11時55分と18時00分に日報リマインダーを送ります📋\n'
             'ボタンをタップして1〜2分で入力できます。'
         )
 
@@ -267,7 +267,7 @@ def register_user(user_id: str, display_name: str) -> str:
     users_sheet.append_row([display_name, user_id])
     return (
         f'✅ {display_name}さんを登録しました！\n'
-        '毎朝9時と14時に日報リマインダーを送ります📋\n'
+        '毎日11時55分と18時00分に日報リマインダーを送ります📋\n'
         'ボタンをタップして1〜2分で入力できます。'
     )
 
