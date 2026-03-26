@@ -104,6 +104,19 @@ ACTION_SHORT = {
     '展示会・イベント':  '展示会',
 }
 
+# ─────────────────────────────────────
+# 問い合わせ自動返信キーワード定義
+# ─────────────────────────────────────
+# 各要素: ( [マッチキーワードリスト], 返信メッセージ )
+# テキストにキーワードが1つでも含まれれば対応する返信を返す（先頭優先）
+INQUIRY_KEYWORDS: list[tuple[list[str], str]] = [
+    (['休暇', '有給'],  '休暇・有給申請は上長に口頭またはLINEで事前連絡してください。'),
+    (['遅刻', '早退'],  '遅刻・早退の場合は出勤前に上長へLINEで連絡してください。'),
+    (['日報', '提出'],  '日報はこのLINEBotに毎日送信してください。'),
+]
+# どのキーワードにもマッチしない場合のデフォルト返信
+INQUIRY_DEFAULT_REPLY = 'お問い合わせを受け付けました。担当者より折り返しご連絡します。'
+
 # 各アクションに対応する「入力待ち状態」と「質問文」の定義
 #
 # フロー別:
@@ -272,6 +285,47 @@ def get_all_user_ids() -> list[str]:
     )
     records = users_sheet.get_all_records()
     return [r['ユーザーID'] for r in records if r.get('ユーザーID')]
+
+
+def save_inquiry(display_name: str, message: str, auto_reply: str):
+    """問い合わせ内容をスプレッドシートの「問い合わせ」シートに記録する。
+    スプレッドシート連携が無効な場合はログのみ出力する。"""
+    now = datetime.now(JST)
+    row = [
+        now.strftime('%Y/%m/%d %H:%M'),
+        display_name,
+        message,
+        auto_reply,
+    ]
+    if not SHEETS_ENABLED:
+        logger.info(f'[SHEETS無効] 問い合わせ記録: {row}')
+        return
+    spreadsheet = get_spreadsheet()
+    sheet = get_or_create_sheet(
+        spreadsheet, '問い合わせ',
+        ['日時', '名前', 'メッセージ内容', '自動返信内容']
+    )
+    sheet.append_row(row)
+    logger.info(f'問い合わせ記録完了: {display_name} / {message[:30]}')
+
+
+def notify_admin_inquiry(display_name: str, message: str):
+    """不明な問い合わせを管理者（LINE_USER_ID）にプッシュ通知する。
+    LINE_USER_IDが未設定の場合はスキップする。"""
+    if not LINE_USER_ID:
+        logger.warning('LINE_USER_IDが未設定のため管理者通知をスキップ')
+        return
+    notify_text = f'【問い合わせ】{display_name}さんからメッセージ：{message}'
+    try:
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).push_message(PushMessageRequest(
+                to=LINE_USER_ID,
+                messages=[TextMessage(text=notify_text)],
+            ))
+        logger.info(f'管理者への問い合わせ通知完了: {display_name}')
+    except Exception as e:
+        logger.error(f'管理者通知エラー: {e}')
+
 
 # ─────────────────────────────────────
 # LINE API ヘルパー
@@ -765,12 +819,32 @@ def handle_message(event):
         state = user_states.get(user_id)
 
         if state is None:
-            # 未登録またはフロー外のメッセージ → 使い方を案内
-            reply_text(
-                reply_token,
-                '「登録」と送ると日報リマインダーの登録ができます📋\n'
-                '日報はリマインダーのボタンから入力してください。'
-            )
+            # 日報フロー外のメッセージ → 問い合わせとして処理
+            display_name = get_display_name(user_id)
+
+            # キーワードマッチング（先頭のルールを優先）
+            auto_reply  = None
+            is_unknown  = False
+            for keywords, reply_msg in INQUIRY_KEYWORDS:
+                if any(kw in text for kw in keywords):
+                    auto_reply = reply_msg
+                    break
+
+            if auto_reply is None:
+                # どのキーワードにもマッチしない → デフォルト返信＋管理者通知
+                auto_reply = INQUIRY_DEFAULT_REPLY
+                is_unknown = True
+
+            # スプレッドシートに記録
+            save_inquiry(display_name, text, auto_reply)
+
+            # ユーザーに自動返信
+            reply_text(reply_token, auto_reply)
+
+            # 不明な問い合わせは管理者にも通知
+            if is_unknown:
+                notify_admin_inquiry(display_name, text)
+
             return
 
         current_state = state['state']
