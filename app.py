@@ -437,6 +437,197 @@ def create_flex_message(time_slot: str) -> FlexMessage:
     )
 
 
+def create_help_flex_message() -> FlexMessage:
+    """使い方ガイド用Flex Messageを作成する"""
+
+    def section_header(title: str, bg_color: str) -> dict:
+        return {
+            'type': 'box',
+            'layout': 'vertical',
+            'backgroundColor': bg_color,
+            'paddingAll': '6px',
+            'cornerRadius': '4px',
+            'contents': [{
+                'type': 'text',
+                'text': title,
+                'color': '#FFFFFF',
+                'weight': 'bold',
+                'size': 'sm',
+            }],
+        }
+
+    def cmd_row(cmd: str, desc: str) -> dict:
+        return {
+            'type': 'box',
+            'layout': 'horizontal',
+            'spacing': 'sm',
+            'alignItems': 'center',
+            'paddingTop': '4px',
+            'contents': [
+                {
+                    'type': 'box',
+                    'layout': 'vertical',
+                    'width': '52px',
+                    'backgroundColor': '#2980B9',
+                    'paddingAll': '4px',
+                    'cornerRadius': '4px',
+                    'contents': [{
+                        'type': 'text',
+                        'text': cmd,
+                        'color': '#FFFFFF',
+                        'size': 'xs',
+                        'weight': 'bold',
+                        'align': 'center',
+                        'wrap': True,
+                    }],
+                },
+                {
+                    'type': 'text',
+                    'text': '\u2192',
+                    'color': '#95A5A6',
+                    'size': 'sm',
+                    'flex': 0,
+                },
+                {
+                    'type': 'text',
+                    'text': desc,
+                    'size': 'sm',
+                    'color': '#34495E',
+                    'wrap': True,
+                    'flex': 1,
+                },
+            ],
+        }
+
+    def schedule_row(time: str, desc: str) -> dict:
+        return {
+            'type': 'box',
+            'layout': 'horizontal',
+            'spacing': 'sm',
+            'alignItems': 'center',
+            'paddingTop': '4px',
+            'contents': [
+                {
+                    'type': 'text',
+                    'text': time,
+                    'size': 'xs',
+                    'weight': 'bold',
+                    'color': '#E67E22',
+                    'flex': 0,
+                    'minWidth': '80px',
+                },
+                {
+                    'type': 'text',
+                    'text': desc,
+                    'size': 'sm',
+                    'color': '#34495E',
+                    'wrap': True,
+                },
+            ],
+        }
+
+    def inquiry_row(keyword: str, desc: str) -> dict:
+        return {
+            'type': 'box',
+            'layout': 'horizontal',
+            'spacing': 'sm',
+            'alignItems': 'center',
+            'paddingTop': '4px',
+            'contents': [
+                {
+                    'type': 'box',
+                    'layout': 'vertical',
+                    'width': '72px',
+                    'backgroundColor': '#27AE60',
+                    'paddingAll': '4px',
+                    'cornerRadius': '4px',
+                    'contents': [{
+                        'type': 'text',
+                        'text': keyword,
+                        'color': '#FFFFFF',
+                        'size': 'xs',
+                        'align': 'center',
+                        'wrap': True,
+                    }],
+                },
+                {
+                    'type': 'text',
+                    'text': '\u2192',
+                    'color': '#95A5A6',
+                    'size': 'sm',
+                    'flex': 0,
+                },
+                {
+                    'type': 'text',
+                    'text': desc,
+                    'size': 'sm',
+                    'color': '#34495E',
+                    'wrap': True,
+                    'flex': 1,
+                },
+            ],
+        }
+
+    flex_dict = {
+        'type': 'bubble',
+        'size': 'giga',
+        'header': {
+            'type': 'box',
+            'layout': 'vertical',
+            'backgroundColor': '#2C3E50',
+            'paddingAll': '16px',
+            'contents': [
+                {
+                    'type': 'text',
+                    'text': '使い方ガイド',
+                    'color': '#FFFFFF',
+                    'weight': 'bold',
+                    'size': 'xl',
+                },
+                {
+                    'type': 'text',
+                    'text': '日報ボットの操作方法',
+                    'color': '#BDC3C7',
+                    'size': 'sm',
+                    'margin': 'xs',
+                },
+            ],
+        },
+        'body': {
+            'type': 'box',
+            'layout': 'vertical',
+            'spacing': 'sm',
+            'paddingAll': '16px',
+            'contents': [
+                # ── 基本コマンド ──
+                section_header('基本コマンド', '#2980B9'),
+                cmd_row('登録',   'ユーザー登録'),
+                cmd_row('日報',   '日報の提出（午前 / 午後）'),
+                cmd_row('確認',   '日報の照会\n1日分・月別・期間指定'),
+                cmd_row('使い方', 'この説明を表示'),
+                {'type': 'separator', 'margin': 'md'},
+                # ── 自動送信スケジュール ──
+                section_header('自動送信スケジュール', '#E67E22'),
+                schedule_row('平日 11:55', '午前の日報リマインダー'),
+                schedule_row('平日 18:00', '午後の日報リマインダー'),
+                schedule_row('金曜 18:15', '週次レポート'),
+                {'type': 'separator', 'margin': 'md'},
+                # ── 問い合わせ ──
+                section_header('問い合わせキーワード', '#27AE60'),
+                inquiry_row('休暇 / 有給', '申請方法を案内'),
+                inquiry_row('遅刻 / 早退', '連絡方法を案内'),
+                inquiry_row('日報 / 提出', '提出方法を案内'),
+                inquiry_row('その他',      '担当者に転送'),
+            ],
+        },
+    }
+
+    return FlexMessage(
+        alt_text='使い方ガイド',
+        contents=FlexContainer.from_dict(flex_dict),
+    )
+
+
 def send_flex_to_all(time_slot: str):
     """登録済み全ユーザーにFlex Messageをプッシュ送信する"""
     try:
@@ -1021,6 +1212,15 @@ def handle_message(event):
             display_name = get_display_name(user_id)
             result_msg   = register_user(user_id, display_name)
             reply_text(reply_token, result_msg)
+            return
+
+        # ──── ヘルプコマンド ────
+        if text.lower() in ('使い方', 'ヘルプ', 'help'):
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message(ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[create_help_flex_message()],
+                ))
             return
 
         # ──── 確認コマンド（日報照会） ────
