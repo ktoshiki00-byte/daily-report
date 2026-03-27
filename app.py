@@ -807,6 +807,190 @@ def _push_to_admins(message: str):
                 logger.error(f'管理者へのプッシュ失敗 ({uid}): {e}')
 
 
+# ─────────────────────────────────────
+# 有給・休暇申請ヘルパー
+# ─────────────────────────────────────
+
+def _calculate_leave_entitlement(hire_date: date) -> int:
+    """入社日から法定有給付与日数を計算する（労基法115条の2に基づく）"""
+    today  = datetime.now(JST).date()
+    months = (today.year - hire_date.year) * 12 + (today.month - hire_date.month)
+    if today.day < hire_date.day:
+        months -= 1
+    if months < 6:   return 0
+    if months < 18:  return 10
+    if months < 30:  return 11
+    if months < 42:  return 12
+    if months < 54:  return 14
+    if months < 66:  return 16
+    if months < 78:  return 18
+    return 20
+
+
+def get_leave_balance_sheet():
+    """有給管理シートを取得または作成する"""
+    spreadsheet = get_spreadsheet()
+    return get_or_create_sheet(
+        spreadsheet, '有給管理',
+        ['名前', 'LINE_USER_ID', '入社日', '付与日数', '使用日数', '残日数', '最終付与日'],
+    )
+
+
+def get_leave_application_sheet():
+    """休暇申請シートを取得または作成する"""
+    spreadsheet = get_spreadsheet()
+    return get_or_create_sheet(
+        spreadsheet, '休暇申請',
+        ['申請日時', '名前', '申請種別', '開始日', '終了日', '日数', '理由',
+         'ステータス', '承認者', '承認日時'],
+    )
+
+
+def _get_user_id_by_name(name: str) -> str:
+    """usersシートから表示名でLINEユーザーIDを検索する"""
+    for u in get_all_users():
+        if u['name'] == name:
+            return u['id']
+    return ''
+
+
+def _get_leave_balance(user_id: str) -> dict | None:
+    """有給管理シートからユーザーの有給情報を取得する。未登録なら None を返す"""
+    sheet   = get_leave_balance_sheet()
+    records = sheet.get_all_records()
+    for i, r in enumerate(records):
+        if r.get('LINE_USER_ID') == user_id:
+            return {'row': i + 2, 'data': r}
+    return None
+
+
+def _submit_leave_application(
+    display_name: str, leave_type: str,
+    start_date: str, end_date: str, days: int, reason: str,
+) -> int:
+    """休暇申請シートに申請行を追加し、挿入した行番号を返す"""
+    sheet            = get_leave_application_sheet()
+    rows_before      = len(sheet.get_all_records())
+    now_str          = datetime.now(JST).strftime('%Y/%m/%d %H:%M')
+    sheet.append_row([now_str, display_name, leave_type,
+                      start_date, end_date, days, reason, '申請中', '', ''])
+    return rows_before + 2  # 行1=ヘッダー、データは行2〜
+
+
+def _notify_admins_leave(
+    display_name: str, leave_type: str,
+    start_date: str, end_date: str, days: int, reason: str, row_num: int,
+):
+    """全管理者に休暇申請通知を送信する（承認・却下ボタン付き）"""
+    admin_ids = get_admin_ids()
+    if not admin_ids:
+        logger.warning('管理者未登録のため休暇申請通知をスキップ')
+        return
+    msg_text = (
+        f'休暇申請が届きました\n\n'
+        f'申請者：{display_name}\n'
+        f'種別：{leave_type}\n'
+        f'期間：{start_date}〜{end_date}（{days}日）\n'
+        f'理由：{reason}'
+    )
+    quick_reply = QuickReply(items=[
+        QuickReplyItem(action=PostbackAction(
+            label='承認',
+            data=f'action=leave_approve&row={row_num}',
+            display_text='承認',
+        )),
+        QuickReplyItem(action=PostbackAction(
+            label='却下',
+            data=f'action=leave_reject&row={row_num}',
+            display_text='却下',
+        )),
+    ])
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        for uid in admin_ids:
+            try:
+                api.push_message(PushMessageRequest(
+                    to=uid,
+                    messages=[TextMessage(text=msg_text, quick_reply=quick_reply)],
+                ))
+            except Exception as e:
+                logger.error(f'申請通知送信失敗 ({uid}): {e}')
+
+
+def _process_leave_decision(row_num: int, admin_id: str, approved: bool) -> str:
+    """休暇申請の承認・却下を処理し、本人に通知する。結果メッセージを返す"""
+    try:
+        app_sheet = get_leave_application_sheet()
+        row_data  = app_sheet.row_values(row_num)
+        if not row_data or len(row_data) < 7:
+            return '申請データが見つかりません。'
+
+        current_status = row_data[7] if len(row_data) > 7 else ''
+        if current_status in ('承認', '却下'):
+            return f'この申請はすでに{current_status}済みです。'
+
+        app_name   = row_data[1]
+        app_type   = row_data[2]
+        start_date = row_data[3]
+        end_date   = row_data[4]
+        try:
+            app_days = int(float(row_data[5]))
+        except (ValueError, IndexError):
+            app_days = 0
+
+        new_status = '承認' if approved else '却下'
+        admin_name = get_display_name(admin_id)
+        now_str    = datetime.now(JST).strftime('%Y/%m/%d %H:%M')
+
+        app_sheet.update_cell(row_num, 8,  new_status)
+        app_sheet.update_cell(row_num, 9,  admin_name)
+        app_sheet.update_cell(row_num, 10, now_str)
+
+        # 有給承認時は残日数を減算
+        if approved and app_type == '有給' and app_days > 0:
+            bal_sheet   = get_leave_balance_sheet()
+            bal_records = bal_sheet.get_all_records()
+            for i, r in enumerate(bal_records):
+                if r.get('名前') == app_name:
+                    used      = int(float(str(r.get('使用日数', 0)))) + app_days
+                    remaining = int(float(str(r.get('残日数', 0)))) - app_days
+                    bal_sheet.update_cell(i + 2, 5, used)
+                    bal_sheet.update_cell(i + 2, 6, remaining)
+                    break
+
+        # 申請者に結果を通知
+        applicant_id = _get_user_id_by_name(app_name)
+        if applicant_id:
+            if approved:
+                notify_text = (
+                    f'休暇申請が承認されました。\n'
+                    f'種別：{app_type}\n'
+                    f'期間：{start_date}〜{end_date}（{app_days}日）\n'
+                    f'承認者：{admin_name}'
+                )
+            else:
+                notify_text = (
+                    f'休暇申請が却下されました。\n'
+                    f'種別：{app_type}\n'
+                    f'期間：{start_date}〜{end_date}\n'
+                    f'担当者にご確認ください。'
+                )
+            try:
+                with ApiClient(configuration) as api_client:
+                    MessagingApi(api_client).push_message(PushMessageRequest(
+                        to=applicant_id,
+                        messages=[TextMessage(text=notify_text)],
+                    ))
+            except Exception as e:
+                logger.error(f'申請者への結果通知失敗 ({applicant_id}): {e}')
+
+        return f'{app_name}さんの申請を{new_status}しました。'
+
+    except Exception as e:
+        logger.error(f'申請決裁処理エラー: {e}')
+        return 'エラーが発生しました。もう一度お試しください。'
+
+
 def _send_daily_report():
     """日報レポートを全管理者に送信するコア処理。
     スプレッドシートが無効または管理者未登録の場合はスキップする。
@@ -1290,6 +1474,72 @@ def handle_message(event):
                 ))
             return
 
+        # ──── 休暇申請コマンド ────
+        if text == '休暇申請':
+            quick_reply = QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(
+                    label='有給',     data='action=leave_type_select&type=有給',     display_text='有給',
+                )),
+                QuickReplyItem(action=PostbackAction(
+                    label='欠勤',     data='action=leave_type_select&type=欠勤',     display_text='欠勤',
+                )),
+                QuickReplyItem(action=PostbackAction(
+                    label='山休み',   data='action=leave_type_select&type=山休み',   display_text='山休み',
+                )),
+                QuickReplyItem(action=PostbackAction(
+                    label='その他',   data='action=leave_type_select&type=その他',   display_text='その他',
+                )),
+            ])
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message(ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[TextMessage(
+                        text='申請種別を選んでください',
+                        quick_reply=quick_reply,
+                    )],
+                ))
+            return
+
+        # ──── 有給残日数コマンド ────
+        if text == '有給残日数':
+            if not SHEETS_ENABLED:
+                reply_text(reply_token, 'スプレッドシートが未設定のため確認できません。')
+                return
+            balance = _get_leave_balance(user_id)
+            if balance is None:
+                reply_text(reply_token, '有給管理に登録されていません。管理者にご確認ください。')
+            else:
+                d = balance['data']
+                reply_text(reply_token,
+                    f'有給残日数\n'
+                    f'付与日数：{d.get("付与日数", 0)}日\n'
+                    f'使用日数：{d.get("使用日数", 0)}日\n'
+                    f'残日数：{d.get("残日数", 0)}日'
+                )
+            return
+
+        # ──── 申請履歴コマンド ────
+        if text == '申請履歴':
+            if not SHEETS_ENABLED:
+                reply_text(reply_token, 'スプレッドシートが未設定のため確認できません。')
+                return
+            display_name  = get_display_name(user_id)
+            app_sheet     = get_leave_application_sheet()
+            records       = app_sheet.get_all_records()
+            user_records  = [r for r in records if r.get('名前') == display_name]
+            recent        = user_records[-5:]
+            if not recent:
+                reply_text(reply_token, '申請履歴がありません。')
+                return
+            lines = ['申請履歴（直近5件）\n']
+            for r in reversed(recent):
+                lines.append(
+                    f'[{r.get("ステータス", "?")}] {r.get("申請種別", "?")} '
+                    f'{r.get("開始日", "?")}〜{r.get("終了日", "?")}（{r.get("日数", "?")}日）'
+                )
+            reply_text(reply_token, '\n'.join(lines))
+            return
+
         # ──── ユーザー状態を確認 ────
         state = user_states.get(user_id)
 
@@ -1324,6 +1574,31 @@ def handle_message(event):
 
         current_state = state['state']
         display_name  = get_display_name(user_id)
+
+        # ──── 休暇申請：理由の入力 ────
+        if current_state == 'leave_reason':
+            leave_type = state.get('leave_type', '')
+            start_date = state.get('leave_start', '')
+            end_date   = state.get('leave_end', '')
+            days       = state.get('leave_days', 0)
+            reason     = text
+            del user_states[user_id]
+            if SHEETS_ENABLED:
+                row_num = _submit_leave_application(
+                    display_name, leave_type, start_date, end_date, days, reason
+                )
+                _notify_admins_leave(
+                    display_name, leave_type, start_date, end_date, days, reason, row_num
+                )
+            reply_text(
+                reply_token,
+                f'申請を受け付けました。\n'
+                f'種別：{leave_type}\n'
+                f'期間：{start_date}〜{end_date}（{days}日）\n'
+                f'理由：{reason}\n\n'
+                f'承認後にLINEでお知らせします。'
+            )
+            return
 
         # ──── 訪問先会社名の入力 ────
         if current_state == 'waiting_for_company':
@@ -1691,6 +1966,100 @@ def handle_postback(event):
         # ──── 友達追加：後で登録する ────
         if action == 'follow_skip':
             reply_text(reply_token, '登録する時は「登録」と送ってください。')
+            return
+
+        # ──── 休暇申請：種別選択 ────
+        if action == 'leave_type_select':
+            leave_type = data_params.get('type', '')
+            quick_reply = QuickReply(items=[
+                QuickReplyItem(action=DatetimePickerAction(
+                    label='開始日を選ぶ',
+                    data=f'action=leave_start_selected&type={leave_type}',
+                    mode='date',
+                ))
+            ])
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message(ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[TextMessage(
+                        text=f'【{leave_type}】\n開始日を選んでください',
+                        quick_reply=quick_reply,
+                    )],
+                ))
+            return
+
+        # ──── 休暇申請：開始日選択後 ────
+        if action == 'leave_start_selected':
+            leave_type = data_params.get('type', '')
+            start_str  = (event.postback.params or {}).get('date', '')
+            if not start_str:
+                reply_text(reply_token, '日付の取得に失敗しました。もう一度お試しください。')
+                return
+            start_date = start_str.replace('-', '/')
+            quick_reply = QuickReply(items=[
+                QuickReplyItem(action=DatetimePickerAction(
+                    label='終了日を選ぶ',
+                    data=f'action=leave_end_selected&type={leave_type}&start={start_date}',
+                    mode='date',
+                ))
+            ])
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message(ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[TextMessage(
+                        text=f'終了日を選んでください（開始日：{start_date}）',
+                        quick_reply=quick_reply,
+                    )],
+                ))
+            return
+
+        # ──── 休暇申請：終了日選択後 ────
+        if action == 'leave_end_selected':
+            leave_type = data_params.get('type', '')
+            start_date = data_params.get('start', '')
+            end_str    = (event.postback.params or {}).get('date', '')
+            if not end_str or not start_date:
+                reply_text(reply_token, '日付の取得に失敗しました。もう一度お試しください。')
+                return
+            end_date = end_str.replace('-', '/')
+            start_d  = datetime.strptime(start_date, '%Y/%m/%d').date()
+            end_d    = datetime.strptime(end_date,   '%Y/%m/%d').date()
+            if end_d < start_d:
+                reply_text(reply_token, '終了日は開始日より後の日付を選んでください。')
+                return
+            days = (end_d - start_d).days + 1
+            user_states[user_id] = {
+                'state':       'leave_reason',
+                'leave_type':  leave_type,
+                'leave_start': start_date,
+                'leave_end':   end_date,
+                'leave_days':  days,
+            }
+            reply_text(
+                reply_token,
+                f'休暇理由を入力してください。\n'
+                f'（{leave_type} {start_date}〜{end_date}、{days}日間）'
+            )
+            return
+
+        # ──── 休暇申請：承認 ────
+        if action == 'leave_approve':
+            if not is_admin(user_id):
+                reply_text(reply_token, '管理者のみ操作できます。')
+                return
+            row_num = int(data_params.get('row', 0))
+            result  = _process_leave_decision(row_num, user_id, approved=True)
+            reply_text(reply_token, result)
+            return
+
+        # ──── 休暇申請：却下 ────
+        if action == 'leave_reject':
+            if not is_admin(user_id):
+                reply_text(reply_token, '管理者のみ操作できます。')
+                return
+            row_num = int(data_params.get('row', 0))
+            result  = _process_leave_decision(row_num, user_id, approved=False)
+            reply_text(reply_token, result)
             return
 
         # ──── 日報入力ボタン ────
