@@ -2157,17 +2157,6 @@ def handle_postback(event):
 # 起動
 # ─────────────────────────────────────
 
-if __name__ == '__main__':@app.route('/morning_report', methods=['GET'])
-def run_morning_report():
-    try:
-        from morning_report import morning_report
-        morning_report()
-        return 'OK', 200
-    except Exception as e:
-        return str(e), 500
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
-
 @app.route('/morning_report', methods=['GET'])
 def run_morning_report():
     try:
@@ -2176,3 +2165,9 @@ def run_morning_report():
         return 'OK', 200
     except Exception as e:
         return str(e), 500
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
+
+
