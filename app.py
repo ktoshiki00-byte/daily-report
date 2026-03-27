@@ -30,6 +30,7 @@ from linebot.v3.webhooks import (
     MessageEvent,
     TextMessageContent,
     PostbackEvent,
+    FollowEvent,
 )
 
 # ─────────────────────────────────────
@@ -602,22 +603,19 @@ def create_help_flex_message() -> FlexMessage:
                 # ── 基本コマンド ──
                 section_header('基本コマンド', '#2980B9'),
                 cmd_row('登録',   'ユーザー登録'),
-                cmd_row('日報',   '日報の提出（午前 / 午後）'),
                 cmd_row('確認',   '日報の照会\n1日分・月別・期間指定'),
                 cmd_row('使い方', 'この説明を表示'),
                 {'type': 'separator', 'margin': 'md'},
                 # ── 自動送信スケジュール ──
                 section_header('自動送信スケジュール', '#E67E22'),
-                schedule_row('平日 11:55', '午前の日報リマインダー'),
-                schedule_row('平日 18:00', '午後の日報リマインダー'),
+                schedule_row('平日 11:55', '午前リマインダー'),
+                schedule_row('平日 18:00', '午後リマインダー'),
                 schedule_row('金曜 18:15', '週次レポート'),
                 {'type': 'separator', 'margin': 'md'},
                 # ── 問い合わせ ──
-                section_header('問い合わせキーワード', '#27AE60'),
-                inquiry_row('休暇 / 有給', '申請方法を案内'),
-                inquiry_row('遅刻 / 早退', '連絡方法を案内'),
-                inquiry_row('日報 / 提出', '提出方法を案内'),
-                inquiry_row('その他',      '担当者に転送'),
+                section_header('問い合わせ', '#27AE60'),
+                inquiry_row('休暇/有給\n遅刻/早退', '自動案内'),
+                inquiry_row('その他',              '担当者に転送'),
             ],
         },
     }
@@ -1199,6 +1197,39 @@ def weekly_report():
 # LINEイベントハンドラ
 # ─────────────────────────────────────
 
+@handler.add(FollowEvent)
+def handle_follow(event):
+    """友達追加時のウェルカムフロー"""
+    reply_token = event.reply_token
+    quick_reply = QuickReply(items=[
+        QuickReplyItem(
+            action=PostbackAction(
+                label='登録する',
+                data='action=follow_register',
+                display_text='登録する',
+            )
+        ),
+        QuickReplyItem(
+            action=PostbackAction(
+                label='後で登録する',
+                data='action=follow_skip',
+                display_text='後で登録する',
+            )
+        ),
+    ])
+    try:
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).reply_message(ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=[TextMessage(
+                    text='日報システムへようこそ！\nユーザー登録しますか？',
+                    quick_reply=quick_reply,
+                )],
+            ))
+    except Exception as e:
+        logger.error(f'handle_follow エラー: {e}')
+
+
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     """テキストメッセージを処理する"""
@@ -1640,6 +1671,25 @@ def handle_postback(event):
             label       = f'{start_d.month}/{start_d.day}〜{end_d.month}/{end_d.day}'
             report_text = _build_range_report_text(name, date_strs, label)
             reply_text(reply_token, report_text)
+            return
+
+        # ──── 友達追加：登録する ────
+        if action == 'follow_register':
+            display_name = get_display_name(user_id)
+            result_msg   = register_user(user_id, display_name)
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message(ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[
+                        TextMessage(text=result_msg),
+                        create_help_flex_message(),
+                    ],
+                ))
+            return
+
+        # ──── 友達追加：後で登録する ────
+        if action == 'follow_skip':
+            reply_text(reply_token, '登録する時は「登録」と送ってください。')
             return
 
         # ──── 日報入力ボタン ────
