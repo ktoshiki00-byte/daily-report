@@ -1423,7 +1423,25 @@ def handle_message(event):
     reply_token = event.reply_token
 
     try:
-        # ──── 登録コマンド ────
+       # ──── 日報入力コマンド ────
+        if text == '日報入力':
+            quick_reply = QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(
+                    label='午前', data='action=午前リマインダー&time_slot=午前', display_text='午前',
+                )),
+                QuickReplyItem(action=PostbackAction(
+                    label='午後', data='action=午後リマインダー&time_slot=午後', display_text='午後',
+                )),
+            ])
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message(ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[TextMessage(
+                        text='午前・午後どちらの日報ですか？',
+                        quick_reply=quick_reply,
+                    )],
+                ))
+            return # ──── 登録コマンド ────
         if text == '登録':
             display_name = get_display_name(user_id)
             result_msg   = register_user(user_id, display_name)
@@ -1994,7 +2012,14 @@ def handle_postback(event):
                 ))
             return
 
-        # ──── 友達追加：後で登録する ────
+        if action in ('午前リマインダー', '午後リマインダー'):
+            flex_msg = create_flex_message(time_slot)
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message(ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[flex_msg],
+                ))
+            return# ──── 友達追加：後で登録する ────
         if action == 'follow_skip':
             reply_text(reply_token, '登録する時は「登録」と送ってください。')
             return
