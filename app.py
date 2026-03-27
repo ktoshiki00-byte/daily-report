@@ -264,14 +264,15 @@ def register_user(user_id: str, display_name: str) -> str:
 
     spreadsheet = get_spreadsheet()
     users_sheet = get_or_create_sheet(
-        spreadsheet, 'users', ['LINE表示名', 'ユーザーID']
+        spreadsheet, 'users', ['LINE表示名', 'ユーザーID', '登録日']
     )
     records = users_sheet.get_all_records()
 
     if any(r.get('ユーザーID') == user_id for r in records):
         return f'{display_name}さんはすでに登録済みです！'
 
-    users_sheet.append_row([display_name, user_id])
+    today = datetime.now(JST).strftime('%Y/%m/%d')
+    users_sheet.append_row([display_name, user_id, today])
     return (
         f'{display_name}さんを登録しました！\n'
         '毎日11時55分と18時00分に日報リマインダーを送ります\n'
