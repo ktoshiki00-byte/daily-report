@@ -156,7 +156,7 @@ ACTION_FIRST_STATE = {
 
 # 入力待ち状態 → ユーザーへの質問文
 STATE_QUESTION = {
-    'waiting_for_company':        '訪問先の会社名を入力してください',
+    'waiting_for_company':        '商談内容を入力してください（例：〇〇社訪問、社内商談、オンライン商談など）',
     'waiting_for_memo':           '自由メモがあれば入力してください\n（スキップする場合は「スキップ」と送信）',
     'waiting_for_destination':    '移動先・目的地を入力してください',
     'waiting_for_work_content':   '作業内容を入力してください',
