@@ -1565,7 +1565,7 @@ def handle_message(event):
                         (hire_date.month + gm - 1) % 12 + 1,
                         hire_date.day
                     ).date()
-                    next_info = f'\n\n次回付与：{next_date.strft
+                    next_info = f'\n\n次回付与：{next_date.strftime("%Y/%m/%d")}\n（{grant_days_map[gm]}日付与予定）'
 
         # ──── 申請履歴コマンド ────
         if text == '申請履歴':
