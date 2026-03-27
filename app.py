@@ -1508,15 +1508,46 @@ def handle_message(event):
             balance = _get_leave_balance(user_id)
             if balance is None:
                 reply_text(reply_token, '有給管理に登録されていません。管理者にご確認ください。')
-            else:
-                d = balance['data']
-                reply_text(reply_token,
-                    f'有給残日数\n'
-                    f'付与日数：{d.get("付与日数", 0)}日\n'
-                    f'使用日数：{d.get("使用日数", 0)}日\n'
-                    f'残日数：{d.get("残日数", 0)}日'
-                )
-            return
+                return
+            d = balance['data']
+            hire_date_str = str(d.get('入社日', ''))
+            try:
+                hire_date = datetime.strptime(hire_date_str, '%Y/%m/%d').date()
+            except ValueError:
+                try:
+                    hire_date = datetime.strptime(hire_date_str, '%Y-%m-%d').date()
+                except ValueError:
+                    reply_text(reply_token, '入社日の形式が正しくありません。管理者にご確認ください。')
+                    return
+            granted = _calculate_leave_entitlement(hire_date)
+            display_name = get_display_name(user_id)
+            used = 0
+            try:
+                app_sheet = get_leave_application_sheet()
+                records   = app_sheet.get_all_records()
+                for r in records:
+                    if (r.get('名前') == display_name
+                            and r.get('申請種別') == '有給'
+                            and r.get('ステータス') == '承認'):
+                        used += int(float(str(r.get('日数', 0))))
+            except Exception as e:
+                logger.error(f'使用日数集計エラー: {e}')
+            remaining = max(0, granted - used)
+            today  = datetime.now(JST).date()
+            months = (today.year - hire_date.year) * 12 + (today.month - hire_date.month)
+            if today.day < hire_date.day:
+                months -= 1
+            grant_schedule = [6, 18, 30, 42, 54, 66, 78]
+            grant_days_map = {6:10, 18:11, 30:12, 42:14, 54:16, 66:18, 78:20}
+            next_info = ''
+            for gm in grant_schedule:
+                if months < gm:
+                    next_date = datetime(
+                        hire_date.year + (hire_date.month + gm - 1) // 12,
+                        (hire_date.month + gm - 1) % 12 + 1,
+                        hire_date.day
+                    ).date()
+                    next_info = f'\n\n次回付与：{next_date.strft
 
         # ──── 申請履歴コマンド ────
         if text == '申請履歴':
