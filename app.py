@@ -1626,7 +1626,7 @@ def handle_message(event):
                 messages=[{"role": "user", "content": text}]
             )
             reply_text(reply_token, msg.content[0].text)
-　　　　　　　return
+            return
 # ──── ユーザー状態を確認 ────
         state = user_states.get(user_id)
 
