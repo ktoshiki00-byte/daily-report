@@ -131,18 +131,20 @@ def morning_report():
     combined = "\n\n".join(
         [f"【{k}】\n{v}" for k, v in reports.items()]
     )
-    summary_q = (
+   summary_q = (
         f"=== 各部門報告 ===\n{combined}\n\n"
         f"=== 市場トレンド ===\n{market_report}\n\n"
         f"=== 商品企画提案 ===\n{planning_report}\n\n"
         "社長向けに以下の形式でまとめてください：\n"
         "🌅 玉樹商店 朝の報告\n\n"
         "📌 今日の最重要3件\n"
-        "①\n②\n③\n\n"
+        "①【営業】...\n"
+        "②【品管/工場】...\n"
+        "③【市場】...\n\n"
         "🛍️ 今週の商品企画チャンス\n"
-        "（具体的な商品アイデアと提案先）\n\n"
+        "（商品名・提案先・製造拠点・単価を明記）\n\n"
         "⚡ 今日やるべきアクション\n"
-        "（具体的に2つ）"
+        "①...\n②..."
     )
 
     try:
