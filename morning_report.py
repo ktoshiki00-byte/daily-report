@@ -1,4 +1,5 @@
 import os
+import time
 import anthropic
 from linebot.v3.messaging import (
     ApiClient, MessagingApi, Configuration,
@@ -58,8 +59,8 @@ SUMMARY_SYSTEM = (
 def ask_claude(system_prompt, question):
     client = anthropic.Anthropic(api_key=CLAUDE_KEY)
     msg = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=300,
+        model="claude-haiku-4-5-20251001",
+        max_tokens=200,
         system=system_prompt,
         messages=[{"role": "user", "content": question}]
     )
@@ -79,15 +80,14 @@ def send_line(text):
 
 # ── メイン処理 ──────────────────────────
 def morning_report():
-    # 7エージェントに朝の質問を送る
     reports = {}
     for name, prompt in AGENTS.items():
         try:
             reports[name] = ask_claude(prompt, MORNING_Q)
+            time.sleep(1)  # メモリ節約のため1秒待機
         except Exception as e:
             reports[name] = f"（取得エラー: {e}）"
 
-    # 7つの報告を統合して社長向けにまとめる
     combined = "\n\n".join(
         [f"【{k}】\n{v}" for k, v in reports.items()]
     )
@@ -106,7 +106,6 @@ def morning_report():
     except Exception as e:
         summary = f"統合レポートエラー: {e}"
 
-    # LINEに送信
     send_line(summary)
     print("朝の報告をLINEに送信しました")
 
