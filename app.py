@@ -1430,7 +1430,22 @@ def handle_message(event):
     reply_token = event.reply_token
 
     try:
-       # ──── 日報入力コマンド ────
+       # ──── 管理者からの深掘り質問 ────
+        if user_id == LINE_USER_ID:
+            import anthropic
+            CLAUDE_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+            client = anthropic.Anthropic(api_key=CLAUDE_KEY)
+            msg = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=400,
+                system="""あなたは玉樹商店の経営参謀AIです。
+食器の製造直販会社（タイ・マレーシア・四日市工場）の社長からの
+質問に対して、市場トレンド・提案先・商品企画の観点で
+具体的かつ簡潔に回答してください。""",
+                messages=[{"role": "user", "content": text}]
+            )
+            reply_text(reply_token, msg.content[0].text)
+            return# ──── 日報入力コマンド ────
         if text == '日報入力':
             quick_reply = QuickReply(items=[
                 QuickReplyItem(action=PostbackAction(
