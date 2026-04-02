@@ -11,7 +11,7 @@ CLAUDE_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 LINE_TOKEN  = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_USER   = os.environ.get("LINE_USER_ID", "")
 
-# ── 各エージェントのプロンプトと朝の質問 ──────
+# ── 各エージェントのプロンプト ──────
 AGENTS = {
     "営業": """あなたは玉樹商店の営業部門を支援するAIエージェントです。
 10年選手の営業として、MUJI・ダイソー・アダストリア等の顧客対応、
@@ -32,14 +32,6 @@ KPI・売上・コスト・予算管理の10年選手として、
     "人事": """あなたは玉樹商店の人事部門を支援するAIエージェントです。
 タイ・マレーシア・四日市・商社部門470名を管轄する10年選手として、
 採用・勤怠・多文化対応をサポートします。""",
-
-    "マーケ": """あなたは玉樹商店のマーケティング部門を支援するAIエージェントです。
-食器市場のトレンド・競合・展示会に精通した10年選手として、
-商品開発と営業に市場インテリジェンスを提供します。""",
-
-    "商品開発": """あなたは玉樹商店の商品開発・企画部門を支援するAIエージェントです。
-食器デザイン・素材・製造工程と市場トレンドを統合判断できる10年選手として、
-企画書・仕様書・サンプル管理をサポートします。""",
 }
 
 MORNING_Q = (
@@ -49,10 +41,28 @@ MORNING_Q = (
     "③リスクや懸念事項"
 )
 
+# ── 市場トレンド調査プロンプト ──────
+MARKET_PROMPT = """あなたは食器市場の市場調査専門家です。
+以下の観点で今週の市場動向を分析してください：
+- 蔦屋書店・フランフラン・actusなどインテリア雑貨店のトレンド
+- Amazon・楽天の食器カテゴリ売れ筋
+- 海外（北米・欧州・東南アジア）の食器トレンド
+- 展示会・新商品情報
+
+玉樹商店はタイ・マレーシア・四日市で食器を製造する会社です。
+陶磁器・メラミン・各種素材の食器を製造できます。"""
+
+MARKET_Q = """今週の食器市場トレンドを分析して以下を教えてください：
+①今最も売れている・注目されている食器カテゴリ（3つ）
+②蔦屋・フランフラン等インテリア雑貨店向けに今提案すべき商品の特徴
+③Amazon・ECで伸びている食器の特徴
+④海外輸出で狙えるカテゴリ
+⑤玉樹商店が今すぐ取り組むべき提案アクション（具体的に2つ）"""
+
 SUMMARY_SYSTEM = (
     "あなたは経営者の朝の意思決定を助けるアシスタントです。"
-    "7つのエージェントからの報告を読んで、社長が今日最も注意すべき"
-    "3件をLINEメッセージとして簡潔にまとめてください。"
+    "各部門の報告と市場情報を読んで、社長が今日最も注意すべき"
+    "内容をLINEメッセージとして簡潔にまとめてください。"
 )
 
 # ── Claude を呼び出す関数 ──────────────
@@ -60,7 +70,7 @@ def ask_claude(system_prompt, question):
     client = anthropic.Anthropic(api_key=CLAUDE_KEY)
     msg = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=200,
+        max_tokens=400,
         system=system_prompt,
         messages=[{"role": "user", "content": question}]
     )
@@ -80,25 +90,39 @@ def send_line(text):
 
 # ── メイン処理 ──────────────────────────
 def morning_report():
+    # 5エージェントに朝の質問
     reports = {}
     for name, prompt in AGENTS.items():
         try:
             reports[name] = ask_claude(prompt, MORNING_Q)
-            time.sleep(1)  # メモリ節約のため1秒待機
+            time.sleep(1)
         except Exception as e:
             reports[name] = f"（取得エラー: {e}）"
 
+    # 市場トレンド調査
+    try:
+        market_report = ask_claude(MARKET_PROMPT, MARKET_Q)
+    except Exception as e:
+        market_report = f"（市場調査エラー: {e}）"
+
+    time.sleep(1)
+
+    # 統合レポート生成
     combined = "\n\n".join(
         [f"【{k}】\n{v}" for k, v in reports.items()]
     )
     summary_q = (
-        f"以下は7エージェントの朝の報告です。\n\n{combined}\n\n"
-        "社長向けに「今日最重要の3件」をまとめてください。\n"
-        "形式：\n"
+        f"以下は各部門の朝の報告と市場情報です。\n\n"
+        f"=== 各部門報告 ===\n{combined}\n\n"
+        f"=== 市場トレンド ===\n{market_report}\n\n"
+        "社長向けに以下の形式でまとめてください：\n"
         "🌅 玉樹商店 朝の報告\n\n"
         "📌 今日の最重要3件\n"
         "①\n②\n③\n\n"
-        "📊 各部門ひとこと（営業／管理／品管／工場）"
+        "🛍️ 今週の市場チャンス\n"
+        "（蔦屋・EC・海外で今すぐ提案できる商品・切り口）\n\n"
+        "⚡ 今日やるべきアクション\n"
+        "（具体的に2つ）"
     )
 
     try:
