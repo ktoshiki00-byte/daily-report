@@ -122,7 +122,7 @@ INQUIRY_KEYWORDS: list[tuple[list[str], str]] = [
     (['日報', '提出'],  '日報はこのLINEBotに毎日送信してください。'),
 ]
 # どのキーワードにもマッチしない場合のデフォルト返信
-INQUIRY_DEFAULT_REPLY = 'お問い合わせを受け付けました。担当者より折り返しご連絡します。'
+INQUIRY_DEFAULT_REPLY = INQUIRY_DEFAULT_REPLY = ''
 
 # 各アクションに対応する「入力待ち状態」と「質問文」の定義
 #
