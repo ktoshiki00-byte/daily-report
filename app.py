@@ -1430,44 +1430,43 @@ def handle_message(event):
     reply_token = event.reply_token
 
     try:
-      try:
-            # ──── 管理者からの深掘り質問 ────
-            if user_id == LINE_USER_ID and text not in ('登録', '確認', '使い方', 'ヘルプ', 'help', '日報入力', '休暇申請', '有給残日数', '申請履歴'):
-                import anthropic
-                CLAUDE_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-                client = anthropic.Anthropic(api_key=CLAUDE_KEY)
-                msg = client.messages.create(
-                    model="claude-haiku-4-5-20251001",
-                    max_tokens=400,
-                    system="""あなたは玉樹商店の経営参謀AIです。
+        # ──── 管理者からの深掘り質問 ────
+        if user_id == LINE_USER_ID and text not in ('登録', '確認', '使い方', 'ヘルプ', 'help', '日報入力', '休暇申請', '有給残日数', '申請履歴'):
+            import anthropic
+            CLAUDE_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+            client = anthropic.Anthropic(api_key=CLAUDE_KEY)
+            msg = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=400,
+                system="""あなたは玉樹商店の経営参謀AIです。
 食器の製造直販会社（タイ・マレーシア・四日市工場）の社長からの
 質問に対して、市場トレンド・提案先・商品企画の観点で
 具体的かつ簡潔に回答してください。""",
-                    messages=[{"role": "user", "content": text}]
-                )
-                reply_text(reply_token, msg.content[0].text)
-                return
+                messages=[{"role": "user", "content": text}]
+            )
+            reply_text(reply_token, msg.content[0].text)
+            return
 
-            # ──── 日報入力コマンド ────
-            if text == '日報入力':
-                quick_reply = QuickReply(items=[
-                    QuickReplyItem(action=PostbackAction(
-                        label='午前', data='action=午前リマインダー&time_slot=午前', display_text='午前',
-                    )),
-                    QuickReplyItem(action=PostbackAction(
-                        label='午後', data='action=午後リマインダー&time_slot=午後', display_text='午後',
-                    )),
-                ])
-                with ApiClient(configuration) as api_client:
-                    MessagingApi(api_client).reply_message(ReplyMessageRequest(
-                        reply_token=reply_token,
-                        messages=[TextMessage(
-                            text='午前・午後どちらの日報ですか？',
-                            quick_reply=quick_reply,
-                        )],
-                    ))
-                return
-            # ──── 登録コマンド ────
+        # ──── 日報入力コマンド ────
+        if text == '日報入力':
+            quick_reply = QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(
+                    label='午前', data='action=午前リマインダー&time_slot=午前', display_text='午前',
+                )),
+                QuickReplyItem(action=PostbackAction(
+                    label='午後', data='action=午後リマインダー&time_slot=午後', display_text='午後',
+                )),
+            ])
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message(ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[TextMessage(
+                        text='午前・午後どちらの日報ですか？',
+                        quick_reply=quick_reply,
+                    )],
+                ))
+            return
+        # ──── 登録コマンド ────
         if text == '登録':
             display_name = get_display_name(user_id)
             result_msg   = register_user(user_id, display_name)
@@ -1615,23 +1614,7 @@ def handle_message(event):
             reply_text(reply_token, '\n'.join(lines))
             return
 
-        # ──── 管理者からの深掘り質問 ────
-        if user_id == LINE_USER_ID and text not in ('登録', '確認', '使い方', 'ヘルプ', 'help', '日報入力', '休暇申請', '有給残日数', '申請履歴'):
-            import anthropic
-            CLAUDE_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-            client = anthropic.Anthropic(api_key=CLAUDE_KEY)
-            msg = client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=400,
-                system="""あなたは玉樹商店の経営参謀AIです。
-食器の製造直販会社（タイ・マレーシア・四日市工場）の社長からの
-質問に対して、市場トレンド・提案先・商品企画の観点で
-具体的かつ簡潔に回答してください。""",
-                messages=[{"role": "user", "content": text}]
-            )
-            reply_text(reply_token, msg.content[0].text)
-            return
-# ──── ユーザー状態を確認 ────
+        # ──── ユーザー状態を確認 ────
         state = user_states.get(user_id)
 
         if state is None:
