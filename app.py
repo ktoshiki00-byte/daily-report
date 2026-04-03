@@ -1466,7 +1466,7 @@ def handle_message(event):
                         quick_reply=quick_reply,
                     )],
                 ))
-            return# ──── 登録コマンド ────
+        return# ──── 登録コマンド ────
         if text == '登録':
             display_name = get_display_name(user_id)
             result_msg   = register_user(user_id, display_name)
