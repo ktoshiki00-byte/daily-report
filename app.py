@@ -1615,7 +1615,7 @@ def handle_message(event):
             return
 
         # ──── 管理者からの深掘り質問 ────
-        if user_id == LINE_USER_ID and state is None:
+        if user_id == LINE_USER_ID and text not in ('登録', '確認', '使い方', 'ヘルプ', 'help', '日報入力', '休暇申請', '有給残日数', '申請履歴'):
             import anthropic
             CLAUDE_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
             client = anthropic.Anthropic(api_key=CLAUDE_KEY)
