@@ -2,7 +2,7 @@ import calendar
 import os
 import json
 import logging
-from collections import Counter
+
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -684,19 +684,6 @@ def build_summary(state: dict, display_name: str) -> str:
         lines.append(f'メモ: {state["memo"]}')
     return '\n'.join(lines)
 
-# ─────────────────────────────────────
-# 状態遷移ロジック
-# ─────────────────────────────────────
-
-def get_next_state(current_state: str, action: str) -> str | None:
-    """現在の状態とアクションから次の状態を返す。保存完了なら None を返す"""
-    if current_state == 'waiting_for_company':
-        # 訪問先会社名を受け取った後は自由メモへ
-        return 'waiting_for_memo'
-
-    # その他の状態はすべて入力1回で完了（保存）
-    return None
-
 
 def finalize_and_save(user_id: str, display_name: str):
     """user_statesの内容をGoogleスプレッドシートに保存する"""
@@ -998,193 +985,6 @@ def _process_leave_decision(row_num: int, admin_id: str, approved: bool) -> str:
         return 'エラーが発生しました。もう一度お試しください。'
 
 
-def _send_daily_report():
-    """日報レポートを全管理者に送信するコア処理。
-    スプレッドシートが無効または管理者未登録の場合はスキップする。
-    ビュー関数（/report）とスケジューラーの両方から呼び出せる。"""
-    if not SHEETS_ENABLED:
-        logger.info('日報レポートをスキップ（スプレッドシート未設定）')
-        return
-    admin_ids = get_admin_ids()
-    if not admin_ids:
-        logger.info('日報レポートをスキップ（管理者未登録）')
-        return
-
-    today      = datetime.now(JST)
-    today_str  = today.strftime('%Y/%m/%d')
-    date_label = f'{today.month}月{today.day}日'
-
-    # 全ユーザーと今日の日報を取得
-    users         = get_all_users()
-    today_records = get_reports_by_date_range([today_str])
-
-    # ユーザー名をキーに午前・午後の最新エントリをまとめる（同一時間帯は後勝ち）
-    user_report_map: dict[str, dict] = {}
-    for record in today_records:
-        name = record.get('ユーザー名', '')
-        slot = record.get('午前or午後', '')
-        if name not in user_report_map:
-            user_report_map[name] = {}
-        user_report_map[name][slot] = record
-
-    # 提出済み・未提出に分類
-    submitted, not_submitted = [], []
-    for user in users:
-        name = user['name']
-        if name in user_report_map:
-            submitted.append((name, user_report_map[name]))
-        else:
-            not_submitted.append(name)
-
-    # メッセージ本文を組み立てる
-    lines = [f'本日の日報レポート（{date_label}）', '']
-    lines.append(f'提出済み（{len(submitted)}名）')
-    for name, slots in submitted:
-        parts = [
-            f'{slot}:{format_action_label(slots[slot])}'
-            for slot in ['午前', '午後'] if slot in slots
-        ]
-        lines.append(f'・{name}｜{" ".join(parts)}')
-    lines.append('')
-    lines.append(f'未提出（{len(not_submitted)}名）')
-    for name in not_submitted:
-        lines.append(f'・{name}')
-
-    # 全管理者に送信
-    _push_to_admins('\n'.join(lines))
-    logger.info('日報レポート送信完了')
-
-
-def _send_weekly_report():
-    """週次振り返りレポートを全登録ユーザーに個別送信するコア処理。
-    ビュー関数（/weekly）とスケジューラーの両方から呼び出せる。"""
-    if not SHEETS_ENABLED:
-        logger.info('週次レポートをスキップ（スプレッドシート未設定）')
-        return
-
-    today  = datetime.now(JST)
-    # 今週の月曜日を算出
-    monday = today - timedelta(days=today.weekday())
-    week_dates     = [monday + timedelta(days=i) for i in range(5)]
-    week_date_strs = [d.strftime('%Y/%m/%d') for d in week_dates]
-    week_label = (
-        f'{monday.month}/{monday.day}〜'
-        f'{week_dates[-1].month}/{week_dates[-1].day}'
-    )
-
-    users        = get_all_users()
-    week_records = get_reports_by_date_range(week_date_strs)
-
-    if not users:
-        logger.info('週次レポートをスキップ（登録ユーザーが0名）')
-        return
-
-    DAY_NAMES = ['月', '火', '水', '木', '金']
-
-    # 管理者サマリー用に各ユーザーの集計結果を蓄積する
-    admin_summary_lines: list[str] = []
-
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-
-        for user in users:
-            name = user['name']
-            uid  = user['id']
-
-            # このユーザーの今週分レコードを日付×時間帯で整理（後勝ち）
-            user_week: dict[str, dict] = {}
-            for record in week_records:
-                if record.get('ユーザー名') != name:
-                    continue
-                date = record.get('日付', '')
-                slot = record.get('午前or午後', '')
-                if date not in user_week:
-                    user_week[date] = {}
-                user_week[date][slot] = record
-
-            # 曜日ごとの行を生成（連続する未入力日はまとめて表示）
-            day_lines: list[str]      = []
-            missing_streak: list[str] = []
-            submitted_days = 0  # 提出済み日数（管理者サマリー用）
-
-            for day_name, date_str in zip(DAY_NAMES, week_date_strs):
-                slots  = user_week.get(date_str, {})
-                has_am = '午前' in slots
-                has_pm = '午後' in slots
-
-                if not has_am and not has_pm:
-                    missing_streak.append(day_name)
-                else:
-                    submitted_days += 1
-                    if missing_streak:
-                        day_lines.append(
-                            f'{missing_streak[0]}｜未入力' if len(missing_streak) == 1
-                            else f'{missing_streak[0]}〜{missing_streak[-1]}｜未入力'
-                        )
-                        missing_streak = []
-                    am_text = format_action_label(slots['午前'], with_emoji=True) if has_am else '未入力'
-                    pm_text = format_action_label(slots['午後'], with_emoji=True) if has_pm else '未入力'
-                    day_lines.append(f'{day_name}｜午前:{am_text} 午後:{pm_text}')
-
-            # 末尾に残った連続未入力をまとめて出力
-            if missing_streak:
-                day_lines.append(
-                    f'{missing_streak[0]}｜未入力' if len(missing_streak) == 1
-                    else f'{missing_streak[0]}〜{missing_streak[-1]}｜未入力'
-                )
-
-            # 今週の商談件数を集計
-            negotiation_count = sum(
-                1 for r in week_records
-                if r.get('ユーザー名') == name and r.get('行動種別') == '商談'
-            )
-
-            # 主な活動内容サマリー（アクション種別ごとの件数、多い順）
-            action_counter = Counter(
-                r.get('行動種別', '')
-                for r in week_records
-                if r.get('ユーザー名') == name and r.get('行動種別')
-            )
-            activity_lines = [
-                f'　{action}：{count}件'
-                for action, count in action_counter.most_common()
-            ]
-            activity_text = '\n'.join(activity_lines) if activity_lines else '　（データなし）'
-
-            # 個人向けメッセージを組み立てる
-            message = (
-                f'今週の振り返り（{week_label}）\n{name}さん\n\n'
-                + '\n'.join(day_lines)
-                + f'\n\n今週の商談件数：{negotiation_count}件'
-                + f'\n\n主な活動内容\n{activity_text}'
-            )
-
-            try:
-                line_bot_api.push_message(PushMessageRequest(
-                    to=uid,
-                    messages=[TextMessage(text=message)],
-                ))
-                logger.info(f'週次レポート送信完了: {name} ({uid})')
-            except Exception as e:
-                logger.error(f'週次レポート送信失敗 ({uid}): {e}')
-
-            # 管理者サマリー用に1行追加
-            admin_summary_lines.append(
-                f'・{name}｜提出{submitted_days}日 商談{negotiation_count}件'
-            )
-
-    # 全管理者に週次サマリーを送信
-    if admin_summary_lines:
-        admin_message = (
-            f'今週の週次サマリー（{week_label}）\n\n'
-            + '\n'.join(admin_summary_lines)
-        )
-        try:
-            _push_to_admins(admin_message)
-            logger.info('週次管理者サマリー送信完了')
-        except Exception as e:
-            logger.error(f'週次管理者サマリー送信失敗: {e}')
-
 
 def _build_report_text(name: str, date_sheet: str, date_label: str) -> str:
     """指定ユーザー・日付の日報テキストを返す。未提出の場合はその旨を返す。"""
@@ -1356,33 +1156,6 @@ def afternoon():
     send_flex_to_all('午後')
     return jsonify({'status': 'ok', 'message': '午後の日報を送信しました'})
 
-
-@app.route('/report', methods=['GET', 'POST'])
-def daily_report():
-    """管理者向け日報レポートを全管理者に送信するエンドポイント。
-    コアロジックは _send_daily_report() に集約している。"""
-    if not SHEETS_ENABLED:
-        return jsonify({'status': 'skip', 'message': 'スプレッドシート未設定のためスキップ'})
-    try:
-        _send_daily_report()
-        return jsonify({'status': 'ok', 'message': '日報レポートを送信しました'})
-    except Exception as e:
-        logger.error(f'daily_report エラー: {e}')
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-
-@app.route('/weekly', methods=['GET', 'POST'])
-def weekly_report():
-    """週次振り返りレポートを全登録ユーザーに個別送信するエンドポイント。
-    コアロジックは _send_weekly_report() に集約している。"""
-    if not SHEETS_ENABLED:
-        return jsonify({'status': 'skip', 'message': 'スプレッドシート未設定のためスキップ'})
-    try:
-        _send_weekly_report()
-        return jsonify({'status': 'ok', 'message': '週次レポートを送信しました'})
-    except Exception as e:
-        logger.error(f'weekly_report エラー: {e}')
-        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
 # ─────────────────────────────────────
@@ -2175,18 +1948,6 @@ def handle_postback(event):
 # 起動
 # ─────────────────────────────────────
 
-@app.route('/morning_report', methods=['GET'])
-@app.route('/morning_report', methods=['GET'])
-def run_morning_report():
-    import threading
-    def run():
-        try:
-            from morning_report import morning_report
-            morning_report()
-        except Exception as e:
-            logger.error(f'morning_report エラー: {e}')
-    threading.Thread(target=run).start()
-    return 'OK', 200
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
