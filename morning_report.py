@@ -91,6 +91,8 @@ def ask_claude(system_prompt, question):
 
 # ── LINEに送信する関数 ──────────────────
 def send_line(text):
+    if not text or not text.strip():
+        text = "（レポート生成に失敗しました）"
     config = Configuration(access_token=LINE_TOKEN)
     with ApiClient(config) as api_client:
         api = MessagingApi(api_client)
@@ -131,7 +133,7 @@ def morning_report():
     combined = "\n\n".join(
         [f"【{k}】\n{v}" for k, v in reports.items()]
     )
-   summary_q = (
+    summary_q = (
         f"=== 各部門報告 ===\n{combined}\n\n"
         f"=== 市場トレンド ===\n{market_report}\n\n"
         f"=== 商品企画提案 ===\n{planning_report}\n\n"
