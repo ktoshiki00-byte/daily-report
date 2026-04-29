@@ -1157,7 +1157,169 @@ def afternoon():
     return jsonify({'status': 'ok', 'message': '午後の日報を送信しました'})
 
 
+@app.route('/report', methods=['GET', 'POST'])
+def daily_report_to_admin():
+    """平日18:30にcron-job.orgから呼ばれるエンドポイント。
+    当日の全ユーザーの日報をまとめて管理者にプッシュ送信する。"""
+    logger.info('日次レポート送信開始')
 
+    try:
+        today     = datetime.now(JST).date()
+        date_str  = today.strftime('%Y/%m/%d')
+        date_label = f'{today.month}月{today.day}日'
+
+        # 当日の全日報データを取得
+        records = get_reports_by_date_range([date_str])
+
+        # 登録ユーザー一覧を取得
+        all_users = get_all_users()
+
+        if not all_users:
+            logger.info('登録ユーザーが0名のため日次レポート送信をスキップ')
+            return jsonify({'status': 'ok', 'message': 'ユーザーなし'})
+
+        # ユーザーごとに日報を整理
+        lines = [f'📋 {date_label}の日報レポート\n']
+
+        submitted_users = set()
+        by_user = {}
+        for rec in records:
+            name = rec.get('ユーザー名', '')
+            if name:
+                submitted_users.add(name)
+                by_user.setdefault(name, []).append(rec)
+
+        # 提出済みユーザー
+        for name in sorted(by_user.keys()):
+            user_records = by_user[name]
+            slot_texts = []
+            for rec in sorted(user_records, key=lambda r: r.get('午前or午後', '')):
+                slot  = rec.get('午前or午後', '')
+                label = format_action_label(rec, with_emoji=True)
+                slot_texts.append(f'{slot}:{label}')
+            lines.append(f'✅ {name}')
+            lines.append(f'  {" / ".join(slot_texts)}')
+
+        # 未提出ユーザー
+        not_submitted = [
+            u['name'] for u in all_users
+            if u['name'] not in submitted_users
+        ]
+        if not_submitted:
+            lines.append('')
+            lines.append('⚠️ 未提出')
+            for name in not_submitted:
+                lines.append(f'  ・{name}')
+
+        # 統計
+        lines.append('')
+        lines.append(
+            f'提出: {len(submitted_users)}/{len(all_users)}名 '
+            f'({round(len(submitted_users)/len(all_users)*100)}%)'
+        )
+
+        report_text = '\n'.join(lines)
+        _push_to_admins(report_text)
+        logger.info('日次レポート送信完了')
+
+        return jsonify({'status': 'ok', 'message': '日次レポートを送信しました'})
+
+    except Exception as e:
+        logger.error(f'日次レポートエラー: {e}')
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/weekly', methods=['GET', 'POST'])
+def weekly_report_to_admin():
+    """金曜18:15にcron-job.orgから呼ばれるエンドポイント。
+    今週（月〜金）の全ユーザーの日報サマリーを管理者にプッシュ送信する。"""
+    logger.info('週次レポート送信開始')
+
+    try:
+        today    = datetime.now(JST).date()
+        # 今週の月曜日を起点にする
+        monday   = today - timedelta(days=today.weekday())
+        friday   = monday + timedelta(days=4)
+
+        # 月〜金の日付リスト（平日のみ）
+        date_strs = []
+        current = monday
+        while current <= min(friday, today):
+            if current.weekday() < 5:
+                date_strs.append(current.strftime('%Y/%m/%d'))
+            current += timedelta(days=1)
+
+        week_label = (
+            f'{monday.month}/{monday.day}〜{friday.month}/{friday.day}'
+        )
+
+        # 全日報データを取得
+        records = get_reports_by_date_range(date_strs)
+
+        # 登録ユーザー一覧
+        all_users = get_all_users()
+
+        if not all_users:
+            logger.info('登録ユーザーが0名のため週次レポート送信をスキップ')
+            return jsonify({'status': 'ok', 'message': 'ユーザーなし'})
+
+        total_days = len(date_strs)
+
+        lines = [f'📊 週次レポート（{week_label}）\n']
+
+        # ユーザーごとに集計
+        from collections import Counter
+        for user in sorted(all_users, key=lambda u: u['name']):
+            name = user['name']
+            user_records = [
+                r for r in records if r.get('ユーザー名') == name
+            ]
+
+            # 提出日数（ユニークな日付数）
+            submitted_dates = set(r.get('日付', '') for r in user_records)
+            submitted_count = len(submitted_dates)
+
+            if submitted_count == 0:
+                lines.append(f'❌ {name}: 提出なし')
+                continue
+
+            rate = round(submitted_count / total_days * 100)
+
+            # アクション別の回数集計
+            action_counter = Counter(
+                r.get('行動種別', '') for r in user_records
+            )
+            top_actions = action_counter.most_common(3)
+            action_summary = ' '.join(
+                f'{ACTION_EMOJI.get(a, "")}{ACTION_SHORT.get(a, a)}({c})'
+                for a, c in top_actions
+            )
+
+            icon = '✅' if rate >= 80 else '⚠️'
+            lines.append(
+                f'{icon} {name}: {submitted_count}/{total_days}日({rate}%) '
+                f'{action_summary}'
+            )
+
+        # 全体統計
+        all_submitted = set(r.get('ユーザー名', '') for r in records)
+        lines.append('')
+        lines.append(
+            f'全体: {len(all_submitted)}/{len(all_users)}名が1件以上提出'
+        )
+
+        report_text = '\n'.join(lines)
+        _push_to_admins(report_text)
+        logger.info('週次レポート送信完了')
+
+        return jsonify({'status': 'ok', 'message': '週次レポートを送信しました'})
+
+    except Exception as e:
+        logger.error(f'週次レポートエラー: {e}')
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+h
 # ─────────────────────────────────────
 # LINEイベントハンドラ
 # ─────────────────────────────────────
