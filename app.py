@@ -1318,8 +1318,6 @@ def weekly_report_to_admin():
         logger.error(f'週次レポートエラー: {e}')
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-
-h
 # ─────────────────────────────────────
 # LINEイベントハンドラ
 # ─────────────────────────────────────
