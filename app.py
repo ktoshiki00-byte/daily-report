@@ -164,24 +164,130 @@ STATE_QUESTION = {
 }
 
 # ─────────────────────────────────────
-# ユーザー状態管理（インメモリ）
+# ユーザー状態管理（Google Sheets永続化）
+# 再起動後も入力中の日報データを復元する
 # ─────────────────────────────────────
-# Render.com無料プランはシングルワーカーのためインメモリで問題なし
-#
-# 形式:
-# {
-#   user_id: {
-#     'state':           str,   # 現在の入力待ち状態
-#     'time_slot':       str,   # '午前' or '午後'
-#     'action':          str,   # 選択されたアクション名
-#     'company':         str,   # 訪問先会社名
-#     'destination':     str,   # 移動先
-#     'work_content':    str,   # 作業内容
-#     'factory_content': str,   # 工場対応内容
-#     'memo':            str,   # 自由メモ
-#   }
-# }
-user_states: dict = {}
+
+
+class StateDict(dict):
+        """フィールド更新のたびにGoogle Sheetsへ自動保存するdictサブクラス"""
+
+    def __init__(self, user_id: str, data: dict, parent):
+                super().__init__(data)
+                object.__setattr__(self, '_user_id', user_id)
+                object.__setattr__(self, '_parent', parent)
+
+    def __setitem__(self, key, value):
+                super().__setitem__(key, value)
+                try:
+                                self._parent._save_to_sheets(self._user_id)
+except Exception as e:
+            logger.error(f'StateDict保存エラー: {e}')
+
+
+class PersistentUserStates:
+        """user_states永続化ラッパー。再起動後も入力中状態を復元する。"""
+
+    SHEET_NAME = '入力中状態'
+    HEADERS = [
+                'user_id', 'state', 'time_slot', 'action',
+                'company', 'destination', 'work_content', 'factory_content', 'memo',
+    ]
+
+    def __init__(self):
+                self._cache: dict = {}
+                self._loaded = False
+
+    def _ensure_loaded(self):
+                if not self._loaded:
+                                self._load_from_sheets()
+                                self._loaded = True
+
+    def _get_sheet(self):
+                spreadsheet = get_spreadsheet()
+                return get_or_create_sheet(spreadsheet, self.SHEET_NAME, self.HEADERS)
+
+    def _load_from_sheets(self):
+                if not SHEETS_ENABLED:
+                                return
+                            try:
+                                            sheet = self._get_sheet()
+                                            records = sheet.get_all_records()
+                                            for rec in records:
+                                                                uid = rec.get('user_id', '')
+                                                                if uid:
+                                                                                        data = {k: rec.get(k, '') for k in self.HEADERS if k != 'user_id'}
+                                                                                        self._cache[uid] = StateDict(uid, data, self)
+                                                                                logger.info(f'入力中状態を復元: {len(self._cache)}件')
+                            except Exception as e:
+            logger.error(f'状態復元エラー: {e}')
+
+    def _save_to_sheets(self, user_id: str):
+                if not SHEETS_ENABLED:
+                                return
+                            try:
+                                            sheet = self._get_sheet()
+                                            records = sheet.get_all_records()
+                                            state_data = self._cache.get(user_id, {})
+                                            row = [user_id] + [state_data.get(k, '') for k in self.HEADERS if k != 'user_id']
+                                            for i, rec in enumerate(records):
+                                                                if rec.get('user_id') == user_id:
+                                                                                        sheet.update(f'A{i + 2}', [row])
+                                                                                        return
+                                                                                sheet.append_row(row)
+                            except Exception as e:
+            logger.error(f'状態保存エラー: {e}')
+
+    def _delete_from_sheets(self, user_id: str):
+                if not SHEETS_ENABLED:
+                                return
+                            try:
+                                            sheet = self._get_sheet()
+                                            records = sheet.get_all_records()
+                                            for i, rec in enumerate(records):
+                                                                if rec.get('user_id') == user_id:
+                                                                                        sheet.delete_rows(i + 2)
+                                                                                        return
+                            except Exception as e:
+            logger.error(f'状態削除エラー: {e}')
+
+    def __contains__(self, user_id: str) -> bool:
+                self._ensure_loaded()
+        return user_id in self._cache
+
+    def __getitem__(self, user_id: str):
+                self._ensure_loaded()
+        return self._cache[user_id]
+
+    def __setitem__(self, user_id: str, value: dict):
+                self._ensure_loaded()
+        if not isinstance(value, StateDict):
+                        value = StateDict(user_id, value, self)
+                    self._cache[user_id] = value
+        self._save_to_sheets(user_id)
+
+    def __delitem__(self, user_id: str):
+                self._ensure_loaded()
+        if user_id in self._cache:
+                        del self._cache[user_id]
+                        self._delete_from_sheets(user_id)
+
+    def get(self, user_id: str, default=None):
+                self._ensure_loaded()
+        return self._cache.get(user_id, default)
+
+    def pop(self, user_id: str, *args):
+                self._ensure_loaded()
+        if user_id in self._cache:
+                        value = self._cache.pop(user_id)
+                        self._delete_from_sheets(user_id)
+                        return value
+                    if args:
+                                    return args[0]
+                                raise KeyError(user_id)
+
+
+user_states = PersistentUserStates()
 
 # ─────────────────────────────────────
 # Google Sheets ヘルパー
