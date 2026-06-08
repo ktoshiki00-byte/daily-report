@@ -169,137 +169,24 @@ STATE_QUESTION = {
 }
 
 # ─────────────────────────────────────
-# ユーザー状態管理（Google Sheets永続化）
-# 再起動後も入力中の日報データを復元する
+# ユーザー状態管理（インメモリ）
 # ─────────────────────────────────────
-
-
-class StateDict(dict):
-    """フィールド更新のたびにGoogle Sheetsへ自動保存するdictサブクラス（バックグラウンド保存）"""
-
-    def __init__(self, user_id: str, data: dict, parent):
-        super().__init__(data)
-        object.__setattr__(self, '_user_id', user_id)
-        object.__setattr__(self, '_parent', parent)
-
-    def __setitem__(self, key, value):
-        super().__setitem__(key, value)
-        def _bg_save():
-            try:
-                self._parent._save_to_sheets(self._user_id)
-            except Exception as e:
-                logger.error(f'StateDict保存エラー: {e}')
-        threading.Thread(target=_bg_save, daemon=True).start()
-
-
-class PersistentUserStates:
-        """user_states永続化ラッパー。再起動後も入力中状態を復元する。"""
-
-    SHEET_NAME = '入力中状態'
-    HEADERS = [
-                'user_id', 'state', 'time_slot', 'action',
-                'company', 'destination', 'work_content', 'factory_content', 'memo',
-    ]
-
-    def __init__(self):
-                self._cache: dict = {}
-                self._loaded = False
-
-    def _ensure_loaded(self):
-                if not self._loaded:
-                                self._load_from_sheets()
-                                self._loaded = True
-
-    def _get_sheet(self):
-                spreadsheet = get_spreadsheet()
-                return get_or_create_sheet(spreadsheet, self.SHEET_NAME, self.HEADERS)
-
-    def _load_from_sheets(self):
-                if not SHEETS_ENABLED:
-                                return
-                            try:
-                                            sheet = self._get_sheet()
-                                            records = sheet.get_all_records()
-                                            for rec in records:
-                                                                uid = rec.get('user_id', '')
-                                                                if uid:
-                                                                                        data = {k: rec.get(k, '') for k in self.HEADERS if k != 'user_id'}
-                                                                                        self._cache[uid] = StateDict(uid, data, self)
-                                                                                logger.info(f'入力中状態を復元: {len(self._cache)}件')
-                            except Exception as e:
-            logger.error(f'状態復元エラー: {e}')
-
-    def _save_to_sheets(self, user_id: str):
-                if not SHEETS_ENABLED:
-                                return
-                            try:
-                                            sheet = self._get_sheet()
-                                            records = sheet.get_all_records()
-                                            state_data = self._cache.get(user_id, {})
-                                            row = [user_id] + [state_data.get(k, '') for k in self.HEADERS if k != 'user_id']
-                                            for i, rec in enumerate(records):
-                                                                if rec.get('user_id') == user_id:
-                                                                                        sheet.update(f'A{i + 2}', [row])
-                                                                                        return
-                                                                                sheet.append_row(row)
-                            except Exception as e:
-            logger.error(f'状態保存エラー: {e}')
-
-    def _delete_from_sheets(self, user_id: str):
-                if not SHEETS_ENABLED:
-                                return
-                            try:
-                                            sheet = self._get_sheet()
-                                            records = sheet.get_all_records()
-                                            for i, rec in enumerate(records):
-                                                                if rec.get('user_id') == user_id:
-                                                                                        sheet.delete_rows(i + 2)
-                                                                                        return
-                            except Exception as e:
-            logger.error(f'状態削除エラー: {e}')
-
-    def __contains__(self, user_id: str) -> bool:
-                self._ensure_loaded()
-        return user_id in self._cache
-
-    def __getitem__(self, user_id: str):
-                self._ensure_loaded()
-        return self._cache[user_id]
-
-    def __setitem__(self, user_id: str, value: dict):
-        self._ensure_loaded()
-        if not isinstance(value, StateDict):
-            value = StateDict(user_id, value, self)
-        self._cache[user_id] = value
-        def _bg_save_us():
-            try:
-                self._save_to_sheets(user_id)
-            except Exception as e:
-                logger.error(f'user_states保存エラー: {e}')
-        threading.Thread(target=_bg_save_us, daemon=True).start()
-
-    def __delitem__(self, user_id: str):
-                self._ensure_loaded()
-        if user_id in self._cache:
-                        del self._cache[user_id]
-                        self._delete_from_sheets(user_id)
-
-    def get(self, user_id: str, default=None):
-                self._ensure_loaded()
-        return self._cache.get(user_id, default)
-
-    def pop(self, user_id: str, *args):
-                self._ensure_loaded()
-        if user_id in self._cache:
-                        value = self._cache.pop(user_id)
-                        self._delete_from_sheets(user_id)
-                        return value
-                    if args:
-                                    return args[0]
-                                raise KeyError(user_id)
-
-
-user_states = PersistentUserStates()
+# Render.com無料プランはシングルワーカーのためインメモリで問題なし
+#
+# 形式:
+# {
+#   user_id: {
+#     'state':           str,   # 現在の入力待ち状態
+#     'time_slot':       str,   # '午前' or '午後'
+#     'action':          str,   # 選択されたアクション名
+#     'company':         str,   # 訪問先会社名
+#     'destination':     str,   # 移動先
+#     'work_content':    str,   # 作業内容
+#     'factory_content': str,   # 工場対応内容
+#     'memo':            str,   # 自由メモ
+#   }
+# }
+user_states: dict = {}
 
 # ─────────────────────────────────────
 # Google Sheets ヘルパー
@@ -321,6 +208,8 @@ def get_spreadsheet():
         client = gspread.authorize(creds)
         _spreadsheet_cache = client.open_by_key(GOOGLE_SHEET_ID)
         return _spreadsheet_cache
+
+
 def get_or_create_sheet(spreadsheet, sheet_name: str, headers: list = None):
     """シートを取得する。存在しない場合は作成してヘッダーを追加する"""
     try:
@@ -334,7 +223,6 @@ def get_or_create_sheet(spreadsheet, sheet_name: str, headers: list = None):
 
 def save_report(
     display_name: str,
-    user_id: str = '',
     time_slot: str,
     action: str,
     company: str = '',
@@ -354,7 +242,6 @@ def save_report(
         now.strftime('%Y/%m/%d'),
         now.strftime('%H:%M'),
         display_name,
-        user_id,
         time_slot,
         action,
         company,
@@ -372,7 +259,7 @@ def save_report(
     spreadsheet = get_spreadsheet()
     sheet = get_or_create_sheet(
         spreadsheet, '日報',
-        ['日付', '時間', 'ユーザー名', 'ユーザーID', '午前or午後', '行動種別',
+        ['日付', '時間', 'ユーザー名', '午前or午後', '行動種別',
          '訪問先会社名', '移動先', '作業内容', '工場対応内容', '自由メモ']
     )
     sheet.append_row(row)
@@ -461,7 +348,8 @@ def notify_admin_inquiry(display_name: str, message: str):
 # ─────────────────────────────────────
 
 def get_display_name(user_id: str) -> str:
-    """LINE APIからユーザーの表示名を取得する"""
+    """LINE APIからユーザーの表示名を取得する。
+    失敗した場合はusersシートの登録名にフォールバックする。"""
     try:
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
@@ -474,6 +362,7 @@ def get_display_name(user_id: str) -> str:
             users = get_all_users()
             for u in users:
                 if u['id'] == user_id:
+                    logger.info(f'usersシートから名前を取得: {u["name"]}')
                     return u['name']
         except Exception:
             pass
@@ -826,7 +715,6 @@ def finalize_and_save(user_id: str, display_name: str):
     s = user_states[user_id]
     save_report(
         display_name       = display_name,
-        user_id            = user_id,
         time_slot          = s['time_slot'],
         action             = s['action'],
         company            = s.get('company', ''),
@@ -1319,13 +1207,9 @@ def daily_report_to_admin():
         lines = [f'📋 {date_label}の日報レポート\n']
 
         submitted_users = set()
-        submitted_user_ids = set()
         by_user = {}
         for rec in records:
             name = rec.get('ユーザー名', '')
-            uid  = rec.get('ユーザーID', '')
-            if uid:
-                submitted_user_ids.add(uid)
             if name:
                 submitted_users.add(name)
                 by_user.setdefault(name, []).append(rec)
@@ -1344,8 +1228,7 @@ def daily_report_to_admin():
         # 未提出ユーザー
         not_submitted = [
             u['name'] for u in all_users
-            if u['id'] not in submitted_user_ids
-            and u['name'] not in submitted_users
+            if u['name'] not in submitted_users
         ]
         if not_submitted:
             lines.append('')
@@ -1414,9 +1297,7 @@ def weekly_report_to_admin():
         for user in sorted(all_users, key=lambda u: u['name']):
             name = user['name']
             user_records = [
-                r for r in records
-                if r.get('ユーザーID') == user.get('id')
-                or (not r.get('ユーザーID') and r.get('ユーザー名') == name)
+                r for r in records if r.get('ユーザー名') == name
             ]
 
             # 提出日数（ユニークな日付数）
@@ -1759,104 +1640,76 @@ def handle_message(event):
             # 「スキップ」の場合はメモなしで保存
             user_states[user_id]['memo'] = '' if text == 'スキップ' else text
             summary = build_summary(user_states[user_id], display_name)
-            # 先にLINEへ返信してからバックグラウンドでSheets保存（LINE 3秒タイムアウト回避）
-            reply_text(reply_token, summary)
+            reply_text(reply_token, summary)  # 先に返信（LINE 3秒タイムアウト対策）
             snap = dict(user_states[user_id])
             snap_dname = display_name
             del user_states[user_id]
-            def _bg_finalize(snap=snap, dname=snap_dname):
+            def _bg_save_memo(snap=snap, dname=snap_dname):
                 try:
-                    save_report(
-                        display_name    = dname,
-                        time_slot       = snap.get('time_slot', ''),
-                        action          = snap.get('action', ''),
-                        company         = snap.get('company', ''),
-                        destination     = snap.get('destination', ''),
-                        work_content    = snap.get('work_content', ''),
-                        factory_content = snap.get('factory_content', ''),
-                        memo            = snap.get('memo', ''),
-                    )
+                    save_report(display_name=dname, time_slot=snap.get('time_slot',''),
+                        action=snap.get('action',''), company=snap.get('company',''),
+                        destination=snap.get('destination',''), work_content=snap.get('work_content',''),
+                        factory_content=snap.get('factory_content',''), memo=snap.get('memo',''))
                 except Exception as e:
                     logger.error(f'バックグラウンド保存エラー: {e}')
-            threading.Thread(target=_bg_finalize, daemon=True).start()
+            threading.Thread(target=_bg_save_memo, daemon=True).start()
             return
 
         # ──── 移動先の入力 ────
         if current_state == 'waiting_for_destination':
             user_states[user_id]['destination'] = text
             summary = build_summary(user_states[user_id], display_name)
-            # 先にLINEへ返信してからバックグラウンドでSheets保存（LINE 3秒タイムアウト回避）
-            reply_text(reply_token, summary)
+            reply_text(reply_token, summary)  # 先に返信（LINE 3秒タイムアウト対策）
             snap = dict(user_states[user_id])
             snap_dname = display_name
             del user_states[user_id]
-            def _bg_finalize(snap=snap, dname=snap_dname):
+            def _bg_save_dest(snap=snap, dname=snap_dname):
                 try:
-                    save_report(
-                        display_name    = dname,
-                        time_slot       = snap.get('time_slot', ''),
-                        action          = snap.get('action', ''),
-                        company         = snap.get('company', ''),
-                        destination     = snap.get('destination', ''),
-                        work_content    = snap.get('work_content', ''),
-                        factory_content = snap.get('factory_content', ''),
-                        memo            = snap.get('memo', ''),
-                    )
+                    save_report(display_name=dname, time_slot=snap.get('time_slot',''),
+                        action=snap.get('action',''), company=snap.get('company',''),
+                        destination=snap.get('destination',''), work_content=snap.get('work_content',''),
+                        factory_content=snap.get('factory_content',''), memo=snap.get('memo',''))
                 except Exception as e:
                     logger.error(f'バックグラウンド保存エラー: {e}')
-            threading.Thread(target=_bg_finalize, daemon=True).start()
+            threading.Thread(target=_bg_save_dest, daemon=True).start()
             return
 
         # ──── 社内作業内容の入力 ────
         if current_state == 'waiting_for_work_content':
             user_states[user_id]['work_content'] = text
             summary = build_summary(user_states[user_id], display_name)
-            # 先にLINEへ返信してからバックグラウンドでSheets保存（LINE 3秒タイムアウト回避）
-            reply_text(reply_token, summary)
+            reply_text(reply_token, summary)  # 先に返信（LINE 3秒タイムアウト対策）
             snap = dict(user_states[user_id])
             snap_dname = display_name
             del user_states[user_id]
-            def _bg_finalize(snap=snap, dname=snap_dname):
+            def _bg_save_work(snap=snap, dname=snap_dname):
                 try:
-                    save_report(
-                        display_name    = dname,
-                        time_slot       = snap.get('time_slot', ''),
-                        action          = snap.get('action', ''),
-                        company         = snap.get('company', ''),
-                        destination     = snap.get('destination', ''),
-                        work_content    = snap.get('work_content', ''),
-                        factory_content = snap.get('factory_content', ''),
-                        memo            = snap.get('memo', ''),
-                    )
+                    save_report(display_name=dname, time_slot=snap.get('time_slot',''),
+                        action=snap.get('action',''), company=snap.get('company',''),
+                        destination=snap.get('destination',''), work_content=snap.get('work_content',''),
+                        factory_content=snap.get('factory_content',''), memo=snap.get('memo',''))
                 except Exception as e:
                     logger.error(f'バックグラウンド保存エラー: {e}')
-            threading.Thread(target=_bg_finalize, daemon=True).start()
+            threading.Thread(target=_bg_save_work, daemon=True).start()
             return
 
         # ──── 工場対応内容の入力 ────
         if current_state == 'waiting_for_factory_content':
             user_states[user_id]['factory_content'] = text
             summary = build_summary(user_states[user_id], display_name)
-            # 先にLINEへ返信してからバックグラウンドでSheets保存（LINE 3秒タイムアウト回避）
-            reply_text(reply_token, summary)
+            reply_text(reply_token, summary)  # 先に返信（LINE 3秒タイムアウト対策）
             snap = dict(user_states[user_id])
             snap_dname = display_name
             del user_states[user_id]
-            def _bg_finalize(snap=snap, dname=snap_dname):
+            def _bg_save_factory(snap=snap, dname=snap_dname):
                 try:
-                    save_report(
-                        display_name    = dname,
-                        time_slot       = snap.get('time_slot', ''),
-                        action          = snap.get('action', ''),
-                        company         = snap.get('company', ''),
-                        destination     = snap.get('destination', ''),
-                        work_content    = snap.get('work_content', ''),
-                        factory_content = snap.get('factory_content', ''),
-                        memo            = snap.get('memo', ''),
-                    )
+                    save_report(display_name=dname, time_slot=snap.get('time_slot',''),
+                        action=snap.get('action',''), company=snap.get('company',''),
+                        destination=snap.get('destination',''), work_content=snap.get('work_content',''),
+                        factory_content=snap.get('factory_content',''), memo=snap.get('memo',''))
                 except Exception as e:
                     logger.error(f'バックグラウンド保存エラー: {e}')
-            threading.Thread(target=_bg_finalize, daemon=True).start()
+            threading.Thread(target=_bg_save_factory, daemon=True).start()
             return
 
     except Exception as e:
