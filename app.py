@@ -334,6 +334,7 @@ def get_or_create_sheet(spreadsheet, sheet_name: str, headers: list = None):
 
 def save_report(
     display_name: str,
+    user_id: str = '',
     time_slot: str,
     action: str,
     company: str = '',
@@ -353,6 +354,7 @@ def save_report(
         now.strftime('%Y/%m/%d'),
         now.strftime('%H:%M'),
         display_name,
+        user_id,
         time_slot,
         action,
         company,
@@ -370,7 +372,7 @@ def save_report(
     spreadsheet = get_spreadsheet()
     sheet = get_or_create_sheet(
         spreadsheet, '日報',
-        ['日付', '時間', 'ユーザー名', '午前or午後', '行動種別',
+        ['日付', '時間', 'ユーザー名', 'ユーザーID', '午前or午後', '行動種別',
          '訪問先会社名', '移動先', '作業内容', '工場対応内容', '自由メモ']
     )
     sheet.append_row(row)
@@ -467,6 +469,14 @@ def get_display_name(user_id: str) -> str:
             return profile.display_name
     except Exception as e:
         logger.error(f'プロフィール取得エラー ({user_id}): {e}')
+        # フォールバック: usersシートに登録済みなら登録名を返す
+        try:
+            users = get_all_users()
+            for u in users:
+                if u['id'] == user_id:
+                    return u['name']
+        except Exception:
+            pass
         return '名無し'
 
 
@@ -816,6 +826,7 @@ def finalize_and_save(user_id: str, display_name: str):
     s = user_states[user_id]
     save_report(
         display_name       = display_name,
+        user_id            = user_id,
         time_slot          = s['time_slot'],
         action             = s['action'],
         company            = s.get('company', ''),
@@ -1308,9 +1319,13 @@ def daily_report_to_admin():
         lines = [f'📋 {date_label}の日報レポート\n']
 
         submitted_users = set()
+        submitted_user_ids = set()
         by_user = {}
         for rec in records:
             name = rec.get('ユーザー名', '')
+            uid  = rec.get('ユーザーID', '')
+            if uid:
+                submitted_user_ids.add(uid)
             if name:
                 submitted_users.add(name)
                 by_user.setdefault(name, []).append(rec)
@@ -1329,7 +1344,8 @@ def daily_report_to_admin():
         # 未提出ユーザー
         not_submitted = [
             u['name'] for u in all_users
-            if u['name'] not in submitted_users
+            if u['id'] not in submitted_user_ids
+            and u['name'] not in submitted_users
         ]
         if not_submitted:
             lines.append('')
@@ -1398,7 +1414,9 @@ def weekly_report_to_admin():
         for user in sorted(all_users, key=lambda u: u['name']):
             name = user['name']
             user_records = [
-                r for r in records if r.get('ユーザー名') == name
+                r for r in records
+                if r.get('ユーザーID') == user.get('id')
+                or (not r.get('ユーザーID') and r.get('ユーザー名') == name)
             ]
 
             # 提出日数（ユニークな日付数）
