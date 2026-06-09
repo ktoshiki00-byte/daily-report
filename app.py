@@ -1,10 +1,14 @@
+import base64
 import calendar
+import hashlib
+import hmac
 import os
 import json
 import logging
 import threading
 
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 from zoneinfo import ZoneInfo
 
 import gspread
@@ -347,8 +351,9 @@ def notify_admin_inquiry(display_name: str, message: str):
 # LINE API ヘルパー
 # ─────────────────────────────────────
 
+@lru_cache(maxsize=256)
 def get_display_name(user_id: str) -> str:
-    """LINE APIからユーザーの表示名を取得する。
+    """LINE APIからユーザーの表示名を取得する（キャッシュ付き）。
     失敗した場合はusersシートの登録名にフォールバックする。"""
     try:
         with ApiClient(configuration) as api_client:
@@ -1152,18 +1157,30 @@ def index():
 
 @app.route('/webhook', methods=['POST'])
 def callback():
-    """LINE Webhookを受け取るエンドポイント"""
+    """LINE Webhookを受け取るエンドポイント（即時200返却＋バックグラウンド処理）"""
     signature = request.headers.get('X-Line-Signature', '')
     body      = request.get_data(as_text=True)
     logger.info('Webhook受信')
 
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
+    # 署名検証のみ同期で実施（HMAC-SHA256）
+    gen_sig = base64.b64encode(
+        hmac.new(LINE_CHANNEL_SECRET.encode('utf-8'),
+                 body.encode('utf-8'), hashlib.sha256).digest()
+    ).decode('utf-8')
+    if not hmac.compare_digest(gen_sig, signature):
         logger.error('署名検証エラー')
         abort(400)
+        return
 
-    return 'OK'
+    # イベント処理はバックグラウンドで実行し即時200を返す
+    def process_in_background():
+        try:
+            handler.handle(body, signature)
+        except Exception as e:
+            logger.error(f'バックグラウンド処理エラー: {e}')
+
+    threading.Thread(target=process_in_background, daemon=True).start()
+    return 'OK', 200
 
 
 @app.route('/morning', methods=['GET', 'POST'])
