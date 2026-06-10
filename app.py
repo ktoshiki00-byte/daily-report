@@ -191,6 +191,8 @@ STATE_QUESTION = {
 #   }
 # }
 user_states: dict = {}
+_display_name_cache: dict = {}
+_DISPLAY_NAME_TTL = 3600
 
 # ─────────────────────────────────────
 # Google Sheets ヘルパー
@@ -351,14 +353,18 @@ def notify_admin_inquiry(display_name: str, message: str):
 # LINE API ヘルパー
 # ─────────────────────────────────────
 
-@lru_cache(maxsize=256)
 def get_display_name(user_id: str) -> str:
-    """LINE APIからユーザーの表示名を取得する（キャッシュ付き）。
+    """LINE APIからユーザーの表示名を取得する（TTLキャッシュ付き）。
     失敗した場合はusersシートの登録名にフォールバックする。"""
+    import time as _time
+    cached = _display_name_cache.get(user_id)
+    if cached and _time.time() - cached['ts'] < _DISPLAY_NAME_TTL:
+        return cached['name']
     try:
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
             profile = line_bot_api.get_profile(user_id)
+            _display_name_cache[user_id] = {'name': profile.display_name, 'ts': _time.time()}
             return profile.display_name
     except Exception as e:
         logger.error(f'プロフィール取得エラー ({user_id}): {e}')
