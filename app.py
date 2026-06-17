@@ -766,12 +766,23 @@ def get_all_users() -> list[dict]:
     users_sheet = get_or_create_sheet(
         spreadsheet, 'users', ['LINE表示名', 'ユーザーID']
     )
-    records = users_sheet.get_all_records()
-    return [
-        {'name': r['LINE表示名'], 'id': r['ユーザーID']}
-        for r in records
-        if r.get('ユーザーID')
-    ]
+    # get_all_records()は空行で止まるため get_all_values() を使用
+    all_values = users_sheet.get_all_values()
+    if len(all_values) < 2:
+        return []
+    headers = all_values[0]
+    try:
+        name_idx = headers.index('LINE表示名')
+        id_idx   = headers.index('ユーザーID')
+    except ValueError:
+        return []
+    result = []
+    for row in all_values[1:]:
+        uid  = row[id_idx].strip()   if len(row) > id_idx   else ''
+        name = row[name_idx].strip() if len(row) > name_idx else ''
+        if uid:
+            result.append({'name': name, 'id': uid})
+    return result
 
 
 def get_reports_by_date_range(date_strs: list[str]) -> list[dict]:
@@ -785,9 +796,26 @@ def get_reports_by_date_range(date_strs: list[str]) -> list[dict]:
         ['日付', '時間', 'ユーザー名', '午前or午後', '行動種別',
          '訪問先会社名', '移動先', '作業内容', '工場対応内容', '自由メモ']
     )
-    all_records = report_sheet.get_all_records()
+    # get_all_records()は空行で止まるため get_all_values() を使用
+    all_values = report_sheet.get_all_values()
+    if len(all_values) < 2:
+        return []
+    headers  = all_values[0]
     date_set = set(date_strs)
-    return [r for r in all_records if r.get('日付') in date_set]
+    try:
+        date_idx = headers.index('日付')
+    except ValueError:
+        return []
+    result = []
+    for row in all_values[1:]:
+        if len(row) > date_idx and row[date_idx] in date_set:
+            row_dict = {
+                headers[i]: row[i]
+                for i in range(len(headers))
+                if i < len(row)
+            }
+            result.append(row_dict)
+    return result
 
 
 def get_admins() -> list[dict]:
