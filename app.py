@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import threading
+import unicodedata
 
 from datetime import date, datetime, timedelta
 from functools import lru_cache
@@ -816,6 +817,15 @@ def normalize_date(value) -> date | None:
         return None
 
 
+def normalize_name(value) -> str:
+    """ユーザー名の表記ゆれを吸収して比較用の文字列に変換する。
+    日報シートの『ユーザー名』はLINEプロフィールの現在の表示名、
+    usersシートの『LINE表示名』は登録時点の表示名のため、両者はずれることがある。
+    全角/半角・前後や途中の空白・大文字小文字の違いを吸収する。"""
+    s = unicodedata.normalize('NFKC', str(value or ''))
+    return ''.join(s.split()).casefold()
+
+
 def get_reports_by_date_range(date_strs: list[str]) -> list[dict]:
     """指定した日付リストに一致する日報レコードをすべて返す。
     日付は表記ゆれを吸収して比較する。
@@ -1087,7 +1097,8 @@ def _process_leave_decision(row_num: int, admin_id: str, approved: bool) -> str:
 def _build_report_text(name: str, date_sheet: str, date_label: str) -> str:
     """指定ユーザー・日付の日報テキストを返す。未提出の場合はその旨を返す。"""
     records = get_reports_by_date_range([date_sheet])
-    user_records = [r for r in records if r.get('ユーザー名') == name]
+    target  = normalize_name(name)
+    user_records = [r for r in records if normalize_name(r.get('ユーザー名')) == target]
     if not user_records:
         return f'{name}さんの{date_label}の日報\n\n未提出です。'
     lines = [f'{name}さんの{date_label}の日報\n']
@@ -1139,28 +1150,36 @@ def _get_last_month_dates() -> tuple[list[str], str]:
 def _build_range_report_text(name: str, date_strs: list[str], label: str) -> str:
     """指定ユーザー・日付リストの日報テキストを返す（複数日対応）"""
     records      = get_reports_by_date_range(date_strs)
-    user_records = [r for r in records if r.get('ユーザー名') == name]
+    target       = normalize_name(name)
+    user_records = [r for r in records if normalize_name(r.get('ユーザー名')) == target]
 
     lines = [f'{name}さんの日報', label, '']
 
     if not user_records:
+        # 名前が一致しない場合の切り分け用。シート上の名前と照会名をログに残す
+        if records:
+            sheet_names = sorted({str(r.get('ユーザー名', '')) for r in records})
+            logger.info(
+                f'期間照会で該当なし: 照会名={name!r} (正規化: {target!r}) / '
+                f'期間内のシート上の名前={sheet_names}'
+            )
         lines.append('この期間のデータはありません。')
         return '\n'.join(lines)
 
-    by_date: dict[str, dict] = {}
+    by_date: dict[date, dict] = {}
     for rec in user_records:
-        d    = rec.get('日付', '')
+        d    = normalize_date(rec.get('日付'))
         slot = rec.get('午前or午後', '')
-        if d not in by_date:
-            by_date[d] = {}
-        by_date[d][slot] = rec
+        if d is None:
+            continue
+        by_date.setdefault(d, {})[slot] = rec
 
     for date_str in date_strs:
-        if date_str not in by_date:
+        d = normalize_date(date_str)
+        if d is None or d not in by_date:
             continue
-        slots  = by_date[date_str]
-        parts  = date_str.split('/')
-        d_lbl  = f'{int(parts[1])}/{int(parts[2])}'
+        slots  = by_date[d]
+        d_lbl  = f'{d.month}/{d.day}'
         slot_texts = [
             f'{slot}:{format_action_label(slots[slot])}'
             for slot in ['午前', '午後'] if slot in slots
@@ -1291,12 +1310,13 @@ def daily_report_to_admin():
         # ユーザーごとに日報を整理
         lines = [f'📋 {date_label}の日報レポート\n']
 
+        # 提出判定は表記ゆれを吸収した名前で行い、表示にはシート上の名前を使う
         submitted_users = set()
         by_user = {}
         for rec in records:
             name = rec.get('ユーザー名', '')
             if name:
-                submitted_users.add(name)
+                submitted_users.add(normalize_name(name))
                 by_user.setdefault(name, []).append(rec)
 
         # 提出済みユーザー
@@ -1313,7 +1333,7 @@ def daily_report_to_admin():
         # 未提出ユーザー
         not_submitted = [
             u['name'] for u in all_users
-            if u['name'] not in submitted_users
+            if normalize_name(u['name']) not in submitted_users
         ]
         if not_submitted:
             lines.append('')
@@ -1380,13 +1400,18 @@ def weekly_report_to_admin():
         # ユーザーごとに集計
         from collections import Counter
         for user in sorted(all_users, key=lambda u: u['name']):
-            name = user['name']
+            name   = user['name']
+            target = normalize_name(name)
             user_records = [
-                r for r in records if r.get('ユーザー名') == name
+                r for r in records
+                if normalize_name(r.get('ユーザー名')) == target
             ]
 
-            # 提出日数（ユニークな日付数）
-            submitted_dates = set(r.get('日付', '') for r in user_records)
+            # 提出日数（ユニークな日付数）。表記ゆれを吸収してから数える
+            submitted_dates = {
+                d for d in (normalize_date(r.get('日付')) for r in user_records)
+                if d is not None
+            }
             submitted_count = len(submitted_dates)
 
             if submitted_count == 0:
@@ -1412,7 +1437,9 @@ def weekly_report_to_admin():
             )
 
         # 全体統計
-        all_submitted = set(r.get('ユーザー名', '') for r in records)
+        all_submitted = {
+            n for n in (normalize_name(r.get('ユーザー名')) for r in records) if n
+        }
         lines.append('')
         lines.append(
             f'全体: {len(all_submitted)}/{len(all_users)}名が1件以上提出'
@@ -1875,7 +1902,11 @@ def handle_postback(event):
             records = get_reports_by_date_range([date_sheet])
             lines   = [f'{date_label}の日報一覧\n']
             for u in users:
-                user_records = [r for r in records if r.get('ユーザー名') == u['name']]
+                target       = normalize_name(u['name'])
+                user_records = [
+                    r for r in records
+                    if normalize_name(r.get('ユーザー名')) == target
+                ]
                 if not user_records:
                     lines.append(f'{u["name"]}：未提出')
                 else:
@@ -2060,24 +2091,28 @@ def handle_postback(event):
             lines   = [f'{label}の日報一覧\n']
             for u in users:
                 uname        = u['name']
-                user_records = [r for r in records if r.get('ユーザー名') == uname]
+                target       = normalize_name(uname)
+                user_records = [
+                    r for r in records
+                    if normalize_name(r.get('ユーザー名')) == target
+                ]
                 lines.append(f'\n{uname}')
                 if not user_records:
                     lines.append('  データなし')
                 else:
-                    by_date: dict[str, dict] = {}
+                    by_date: dict[date, dict] = {}
                     for rec in user_records:
-                        d    = rec.get('日付', '')
+                        d    = normalize_date(rec.get('日付'))
                         slot = rec.get('午前or午後', '')
-                        if d not in by_date:
-                            by_date[d] = {}
-                        by_date[d][slot] = rec
-                    for date_str in date_strs:
-                        if date_str not in by_date:
+                        if d is None:
                             continue
-                        slots      = by_date[date_str]
-                        parts      = date_str.split('/')
-                        d_lbl      = f'{int(parts[1])}/{int(parts[2])}'
+                        by_date.setdefault(d, {})[slot] = rec
+                    for date_str in date_strs:
+                        d = normalize_date(date_str)
+                        if d is None or d not in by_date:
+                            continue
+                        slots      = by_date[d]
+                        d_lbl      = f'{d.month}/{d.day}'
                         slot_texts = [
                             f'{slot}:{format_action_label(slots[slot])}'
                             for slot in ['午前', '午後'] if slot in slots
