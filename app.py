@@ -5,6 +5,7 @@ import hmac
 import os
 import json
 import logging
+import re
 import threading
 
 from datetime import date, datetime, timedelta
@@ -785,8 +786,39 @@ def get_all_users() -> list[dict]:
     return result
 
 
+def normalize_date(value) -> date | None:
+    """日付の表記ゆれを吸収してdateオブジェクトに変換する。
+    '2026/07/16'、'2026/7/16'、'2026-07-16'、'7/16' などをすべて同じ日付として扱う。
+    年が省略されている場合は現在の年（JST）とみなす。
+    日付として解釈できない場合はNoneを返す。"""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+
+    nums = [int(n) for n in re.findall(r'\d+', str(value))]
+    if len(nums) < 2:
+        return None
+
+    # 先頭が32以上なら年付き（2026/7/16）、そうでなければ年省略（7/16）とみなす。
+    # 末尾の時刻などは無視する。
+    if nums[0] > 31:
+        if len(nums) < 3:
+            return None
+        year, month, day = nums[0], nums[1], nums[2]
+    else:
+        year = datetime.now(JST).year
+        month, day = nums[0], nums[1]
+
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
 def get_reports_by_date_range(date_strs: list[str]) -> list[dict]:
     """指定した日付リストに一致する日報レコードをすべて返す。
+    日付は表記ゆれを吸収して比較する。
     スプレッドシート連携が無効な場合は空リストを返す。"""
     if not SHEETS_ENABLED:
         return []
@@ -801,14 +833,16 @@ def get_reports_by_date_range(date_strs: list[str]) -> list[dict]:
     if len(all_values) < 2:
         return []
     headers  = all_values[0]
-    date_set = set(date_strs)
+    date_set = {d for d in map(normalize_date, date_strs) if d is not None}
     try:
         date_idx = headers.index('日付')
     except ValueError:
         return []
     result = []
     for row in all_values[1:]:
-        if len(row) > date_idx and row[date_idx] in date_set:
+        if len(row) <= date_idx:
+            continue
+        if normalize_date(row[date_idx]) in date_set:
             row_dict = {
                 headers[i]: row[i]
                 for i in range(len(headers))
