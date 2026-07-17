@@ -9,6 +9,7 @@ import re
 import threading
 import unicodedata
 
+from collections import Counter
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from zoneinfo import ZoneInfo
@@ -96,6 +97,11 @@ JST = ZoneInfo('Asia/Tokyo')
 # 定数定義
 # ─────────────────────────────────────
 
+# postbackのaction名（行動種別の値と衝突しない名前にする）
+ACTION_START_REPORT = 'start_report'   # 日報入力フローの開始
+ACTION_SKIP_SLOT    = 'skip_slot'      # 午前 or 午後をスキップ
+ACTION_MY_WEEKLY    = 'my_weekly'      # 本人の週次まとめ
+
 # 日報ボタンの定義（label: 表示名, value: 記録値）
 ACTIONS = [
     {'label': '商談',          'value': '商談'},
@@ -179,12 +185,17 @@ STATE_QUESTION = {
 # ─────────────────────────────────────
 # Render.com無料プランはシングルワーカーのためインメモリで問題なし
 #
+# 1回のフローで午前・午後の両方を入力する。
+# 午前が終わった時点でその内容を rows に退避し、続けて午後を入力する。
+# 最後に rows の各要素を1行ずつ日報シートに保存する（既存の1行=1スロット形式）。
+#
 # 形式:
 # {
 #   user_id: {
 #     'state':           str,   # 現在の入力待ち状態
-#     'time_slot':       str,   # '午前' or '午後'
-#     'action':          str,   # 選択されたアクション名
+#     'time_slot':       str,   # 入力中のスロット '午前' or '午後'
+#     'rows':            list,  # 入力済みスロットのリスト（save_reportに渡す形）
+#     'action':          str,   # 入力中スロットのアクション名
 #     'company':         str,   # 訪問先会社名
 #     'destination':     str,   # 移動先
 #     'work_content':    str,   # 作業内容
@@ -192,6 +203,7 @@ STATE_QUESTION = {
 #     'memo':            str,   # 自由メモ
 #   }
 # }
+# 開始ボタンを押すたびに初期化されるため、途中で放置してもやり直せる。
 user_states: dict = {}
 _display_name_cache: dict = {}
 _DISPLAY_NAME_TTL = 3600
@@ -431,19 +443,85 @@ def reply_error(reply_token: str):
 # Flex Message 生成
 # ─────────────────────────────────────
 
-def create_flex_message(time_slot: str) -> FlexMessage:
-    """日報入力用Flex Messageを作成する"""
-    # 時間帯でヘッダー色・タイトル・サブテキストを変える
+def create_reminder_flex_message() -> FlexMessage:
+    """18:00の日報リマインダー用Flex Messageを作成する。
+    ボタンを押すと午前→午後の順に入力するフローが始まる。"""
+    flex_dict = {
+        'type': 'bubble',
+        'size': 'mega',
+        'header': {
+            'type': 'box',
+            'layout': 'vertical',
+            'backgroundColor': '#1565C0',
+            'paddingAll': '15px',
+            'contents': [
+                {
+                    'type': 'text',
+                    'text': '今日の日報入力',
+                    'weight': 'bold',
+                    'color': '#ffffff',
+                    'size': 'lg',
+                }
+            ],
+        },
+        'body': {
+            'type': 'box',
+            'layout': 'vertical',
+            'spacing': 'sm',
+            'paddingAll': '13px',
+            'contents': [
+                {
+                    'type': 'text',
+                    'text': '今日も一日お疲れ様でした。\n'
+                            '今日の日報を入力してください。\n'
+                            '午前・午後の順に伺います。',
+                    'wrap': True,
+                    'color': '#555555',
+                    'size': 'sm',
+                    'margin': 'xs',
+                },
+                {
+                    'type': 'button',
+                    'action': {
+                        'type': 'postback',
+                        'label': '日報を入力',
+                        'data': f'action={ACTION_START_REPORT}',
+                        'displayText': '日報を入力',
+                    },
+                    'style': 'primary',
+                    'margin': 'md',
+                    'height': 'sm',
+                },
+                {
+                    'type': 'button',
+                    'action': {
+                        'type': 'postback',
+                        'label': '週次まとめを見る',
+                        'data': f'action={ACTION_MY_WEEKLY}',
+                        'displayText': '週次まとめ',
+                    },
+                    'style': 'link',
+                    'margin': 'sm',
+                    'height': 'sm',
+                },
+            ],
+        },
+    }
+
+    return FlexMessage(
+        alt_text='今日の日報を入力してください',
+        contents=FlexContainer.from_dict(flex_dict),
+    )
+
+
+def create_action_flex_message(time_slot: str, note: str = '') -> FlexMessage:
+    """行動種別を選ぶFlex Messageを作成する。
+    noteを渡すとボタンの上に案内文を表示する。"""
     if time_slot == '午前':
-        header_color = '#FF8C00'      # オレンジ（朝）
-        title        = '午前の日報入力'
-        sub_text     = '今の活動を選んでください'
+        header_color = '#FF8C00'      # オレンジ（午前）
     else:
         header_color = '#1565C0'      # ブルー（午後）
-        title        = '午後の日報入力'
-        sub_text     = '今日も一日お疲れ様でした。\n今の活動を選んでください'
 
-    # ボタンを生成
     # 訪問系アクション（company入力あり）→ primary、それ以外 → secondary
     visit_actions = {'商談', 'メーカー訪問', '展示会・イベント'}
     buttons = []
@@ -462,6 +540,40 @@ def create_flex_message(time_slot: str) -> FlexMessage:
             'height': 'sm',
         })
 
+    # スキップボタン
+    buttons.append({
+        'type': 'button',
+        'action': {
+            'type': 'postback',
+            'label': f'{time_slot}をスキップ',
+            'data': f'action={ACTION_SKIP_SLOT}&time_slot={time_slot}',
+            'displayText': f'{time_slot}をスキップ',
+        },
+        'style': 'link',
+        'margin': 'sm',
+        'height': 'sm',
+    })
+
+    body_texts = []
+    if note:
+        body_texts.append({
+            'type': 'text',
+            'text': note,
+            'wrap': True,
+            'color': '#D32F2F',
+            'size': 'sm',
+            'weight': 'bold',
+            'margin': 'xs',
+        })
+    body_texts.append({
+        'type': 'text',
+        'text': f'{time_slot}の活動を選んでください',
+        'wrap': True,
+        'color': '#555555',
+        'size': 'sm',
+        'margin': 'xs',
+    })
+
     flex_dict = {
         'type': 'bubble',
         'size': 'mega',
@@ -473,7 +585,7 @@ def create_flex_message(time_slot: str) -> FlexMessage:
             'contents': [
                 {
                     'type': 'text',
-                    'text': title,
+                    'text': f'{time_slot}の日報入力',
                     'weight': 'bold',
                     'color': '#ffffff',
                     'size': 'lg',
@@ -486,21 +598,14 @@ def create_flex_message(time_slot: str) -> FlexMessage:
             'spacing': 'sm',
             'paddingAll': '13px',
             'contents': [
-                {
-                    'type': 'text',
-                    'text': sub_text,
-                    'wrap': True,
-                    'color': '#555555',
-                    'size': 'sm',
-                    'margin': 'xs',
-                },
+                *body_texts,
                 *buttons,
             ],
         },
     }
 
     return FlexMessage(
-        alt_text=f'{time_slot}の日報を入力してください',
+        alt_text=f'{time_slot}の活動を選んでください',
         contents=FlexContainer.from_dict(flex_dict),
     )
 
@@ -679,12 +784,11 @@ def create_help_flex_message() -> FlexMessage:
                 {'type': 'separator', 'margin': 'md'},
                 section_header('日報', '#E74C3C'),
                 cmd_row('日報入力',   '午前・午後の日報を入力'),
+                cmd_row('週次まとめ', '今週の自分の日報を確認'),
                 {'type': 'separator', 'margin': 'md'},
                 # ── 自動送信スケジュール ──
                 section_header('自動送信スケジュール', '#E67E22'),
-                schedule_row('平日 11:55', '午前リマインダー'),
-                schedule_row('平日 18:00', '午後リマインダー'),
-                schedule_row('金曜 18:15', '週次レポート'),
+                schedule_row('平日 18:00', '日報入力のお知らせ'),
                 {'type': 'separator', 'margin': 'md'},
                 # ── 問い合わせ ──
                 section_header('問い合わせ', '#27AE60'),
@@ -700,15 +804,15 @@ def create_help_flex_message() -> FlexMessage:
     )
 
 
-def send_flex_to_all(time_slot: str):
-    """登録済み全ユーザーにFlex Messageをプッシュ送信する"""
+def send_reminder_to_all():
+    """登録済み全ユーザーに日報リマインダーをプッシュ送信する"""
     try:
         user_ids = get_all_user_ids()
         if not user_ids:
             logger.info('登録ユーザーが0名のため送信をスキップ')
             return
 
-        flex_msg = create_flex_message(time_slot)
+        flex_msg = create_reminder_flex_message()
 
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
@@ -729,72 +833,178 @@ def send_flex_to_all(time_slot: str):
 # サマリーテキスト生成
 # ─────────────────────────────────────
 
-def build_summary(state: dict, display_name: str) -> str:
-    """記録完了時のサマリー文字列を生成する"""
+def build_summary(rows: list[dict], display_name: str) -> str:
+    """記録完了時のサマリー文字列を生成する（午前・午後をまとめて表示）"""
     lines = [
         '記録しました！',
         '━━━━━━━━━━━',
         f'{display_name}',
-        f'{state["time_slot"]}',
-        f'{state["action"]}',
     ]
-    if state.get('company'):
-        lines.append(f'訪問先: {state["company"]}')
-    if state.get('destination'):
-        lines.append(f'移動先: {state["destination"]}')
-    if state.get('work_content'):
-        lines.append(f'作業内容: {state["work_content"]}')
-    if state.get('factory_content'):
-        lines.append(f'対応内容: {state["factory_content"]}')
-    if state.get('memo'):
-        lines.append(f'メモ: {state["memo"]}')
+    for row in rows:
+        lines.append('')
+        lines.append(f'【{row["time_slot"]}】{row["action"]}')
+        if row.get('company'):
+            lines.append(f'訪問先: {row["company"]}')
+        if row.get('destination'):
+            lines.append(f'移動先: {row["destination"]}')
+        if row.get('work_content'):
+            lines.append(f'作業内容: {row["work_content"]}')
+        if row.get('factory_content'):
+            lines.append(f'対応内容: {row["factory_content"]}')
+        if row.get('memo'):
+            lines.append(f'メモ: {row["memo"]}')
+
+    recorded = {row['time_slot'] for row in rows}
+    skipped  = [slot for slot in ('午前', '午後') if slot not in recorded]
+    if skipped:
+        lines.append('')
+        lines.append(f'（{"・".join(skipped)}はスキップ）')
     return '\n'.join(lines)
 
 
-def finalize_and_save(user_id: str, display_name: str):
-    """user_statesの内容をGoogleスプレッドシートに保存する"""
-    s = user_states[user_id]
-    save_report(
-        display_name       = display_name,
-        time_slot          = s['time_slot'],
-        action             = s['action'],
-        company            = s.get('company', ''),
-        destination        = s.get('destination', ''),
-        work_content       = s.get('work_content', ''),
-        factory_content    = s.get('factory_content', ''),
-        memo               = s.get('memo', ''),
-    )
-
-
-def save_and_reply(reply_token: str, display_name: str, snap: dict, summary: str):
+def save_and_reply(reply_token: str, display_name: str,
+                   rows: list[dict], summary: str):
     """日報を保存し、その結果を返信する。
 
     保存を待ってから返信するため、成功したと偽って伝えることがない。
     /webhook は既に即時200を返しており（callback参照）、この処理自体が
     バックグラウンドスレッドで動いているため、保存を待ってから返信しても
     LINEの3秒タイムアウトには当たらない。
+
+    rowsは午前・午後それぞれのスロットで、1件が日報シートの1行になる。
     """
+    saved = 0
     try:
-        save_report(
-            display_name    = display_name,
-            time_slot       = snap.get('time_slot', ''),
-            action          = snap.get('action', ''),
-            company         = snap.get('company', ''),
-            destination     = snap.get('destination', ''),
-            work_content    = snap.get('work_content', ''),
-            factory_content = snap.get('factory_content', ''),
-            memo            = snap.get('memo', ''),
-        )
+        for row in rows:
+            save_report(display_name=display_name, **row)
+            saved += 1
     except Exception:
         # 入力内容をログに残す（シートに残らないため復旧の手がかりになる）
-        logger.error(f'日報の保存に失敗: {display_name} / {snap}', exc_info=True)
-        reply_text(
-            reply_token,
-            '⚠️ 保存に失敗しました。もう一度送信してください。'
+        logger.error(
+            f'日報の保存に失敗: {display_name} / {saved}/{len(rows)}件保存済み / '
+            f'{rows}',
+            exc_info=True
         )
+        if saved:
+            # 一部だけ保存された。やり直すと重複するため、その旨を伝える
+            reply_text(
+                reply_token,
+                '⚠️ 保存に失敗しました。もう一度送信してください。\n'
+                f'（{saved}件は記録済みのため、重複したら管理者にご連絡ください）'
+            )
+        else:
+            reply_text(
+                reply_token,
+                '⚠️ 保存に失敗しました。もう一度送信してください。'
+            )
         return
 
     reply_text(reply_token, summary)
+
+
+# ─────────────────────────────────────
+# 日報入力フロー制御（午前 → 午後 → 保存）
+# ─────────────────────────────────────
+
+def start_report_flow(user_id: str, reply_token: str, note: str = ''):
+    """日報入力フローを最初（午前の行動種別選択）から開始する。
+    既存の入力途中の状態は破棄されるため、放置後に押し直せばやり直せる。"""
+    user_states[user_id] = {
+        'state':           'waiting_for_action',
+        'time_slot':       '午前',
+        'rows':            [],
+        'action':          '',
+        'company':         '',
+        'destination':     '',
+        'work_content':    '',
+        'factory_content': '',
+        'memo':            '',
+    }
+    reply_action_flex(reply_token, '午前', note)
+
+
+def reply_action_flex(reply_token: str, time_slot: str, note: str = ''):
+    """行動種別の選択ボタンを返信する"""
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).reply_message(ReplyMessageRequest(
+            reply_token=reply_token,
+            messages=[create_action_flex_message(time_slot, note)],
+        ))
+
+
+def reply_my_weekly_report(user_id: str, reply_token: str):
+    """本人の今週分のまとめを返信する。
+    名前はLINEの表示名から取得するため、他人の分は取得できない。"""
+    if not SHEETS_ENABLED:
+        reply_text(reply_token, 'スプレッドシートが未設定のため確認できません。')
+        return
+    display_name = get_display_name(user_id)
+    reply_text(reply_token, build_my_weekly_report_text(display_name))
+
+
+def _is_current_slot(user_id: str, time_slot: str) -> bool:
+    """押されたボタンが、いま入力中のスロットのものかを判定する。
+    古い通知のボタンを押した場合に、午前の内容を午後として記録しないための確認。"""
+    state = user_states.get(user_id)
+    if state is None:
+        return False
+    return state['time_slot'] == time_slot
+
+
+def _clear_slot_fields(state: dict):
+    """入力中スロットの作業用フィールドを初期化する"""
+    state['action'] = ''
+    for key in ('company', 'destination', 'work_content',
+                'factory_content', 'memo'):
+        state[key] = ''
+
+
+def _advance_slot(user_id: str, reply_token: str, display_name: str):
+    """午前が終わったら午後へ進み、午後が終わったら保存して完了する"""
+    state = user_states[user_id]
+    if state['time_slot'] == '午前':
+        state['time_slot'] = '午後'
+        state['state']     = 'waiting_for_action'
+        _clear_slot_fields(state)
+        reply_action_flex(reply_token, '午後')
+        return
+    finish_report_flow(user_id, reply_token, display_name)
+
+
+def complete_slot(user_id: str, reply_token: str, display_name: str):
+    """入力中スロットの内容を確定し、次へ進む"""
+    state = user_states[user_id]
+    state['rows'].append({
+        'time_slot':       state['time_slot'],
+        'action':          state['action'],
+        'company':         state.get('company', ''),
+        'destination':     state.get('destination', ''),
+        'work_content':    state.get('work_content', ''),
+        'factory_content': state.get('factory_content', ''),
+        'memo':            state.get('memo', ''),
+    })
+    _advance_slot(user_id, reply_token, display_name)
+
+
+def skip_slot(user_id: str, reply_token: str, display_name: str):
+    """入力中スロットを記録せずに次へ進む"""
+    _advance_slot(user_id, reply_token, display_name)
+
+
+def finish_report_flow(user_id: str, reply_token: str, display_name: str):
+    """入力済みの内容を保存して完了する。
+    午前・午後の両方がスキップされた場合は、最低1つの入力を促してやり直す。"""
+    rows = user_states[user_id]['rows']
+    if not rows:
+        start_report_flow(
+            user_id, reply_token,
+            note='午前・午後のどちらかは入力してください。'
+        )
+        return
+    summary = build_summary(rows, display_name)
+    del user_states[user_id]
+    save_and_reply(reply_token, display_name, rows, summary)
+
 
 # ─────────────────────────────────────
 # レポート用ヘルパー
@@ -1329,26 +1539,20 @@ def callback():
     return 'OK', 200
 
 
-@app.route('/morning', methods=['GET', 'POST'])
-def morning():
-    """午前9:00にcron-job.orgから呼ばれるエンドポイント"""
-    logger.info('午前プッシュ開始')
-    send_flex_to_all('午前')
-    return jsonify({'status': 'ok', 'message': '午前の日報を送信しました'})
-
-
-@app.route('/afternoon', methods=['GET', 'POST'])
-def afternoon():
-    """午後14:00にcron-job.orgから呼ばれるエンドポイント"""
-    logger.info('午後プッシュ開始')
-    send_flex_to_all('午後')
-    return jsonify({'status': 'ok', 'message': '午後の日報を送信しました'})
+@app.route('/reminder', methods=['GET', 'POST'])
+def reminder():
+    """平日18:00 JSTにcron-job.orgから呼ばれるエンドポイント。
+    全ユーザーに日報入力の通知を1回だけ送る（午前・午後をまとめて入力する）。"""
+    logger.info('日報リマインダー送信開始')
+    send_reminder_to_all()
+    return jsonify({'status': 'ok', 'message': '日報リマインダーを送信しました'})
 
 
 @app.route('/report', methods=['GET', 'POST'])
 def daily_report_to_admin():
-    """平日18:30にcron-job.orgから呼ばれるエンドポイント。
-    当日の全ユーザーの日報をまとめて管理者にプッシュ送信する。"""
+    """19:30 JSTにcron-job.orgから呼ばれるエンドポイント。
+    当日の全ユーザーの日報をまとめて管理者にプッシュ送信する。
+    金曜はこれに続けて週次レポートも送る（cronジョブを1本にまとめるため）。"""
     logger.info('日次レポート送信開始')
 
     try:
@@ -1359,9 +1563,7 @@ def daily_report_to_admin():
         # 当日の全日報データを取得
         records = get_reports_by_date_range([date_str])
 
-        # 当日分として拾った行を、シート上の生の日付つきでログに残す。
-        # 年なしの日付（例: '7/16'）は現在の年として解釈されるため、
-        # 過去の行を当日分として誤って拾っていないか確認できるようにする
+        # 当日分として拾った行を、シート上の生の日付つきでログに残す
         logger.info(
             f'日次レポート対象={date_str} / 該当 {len(records)} 件: '
             + str([
@@ -1422,108 +1624,164 @@ def daily_report_to_admin():
         _push_to_admins(report_text)
         logger.info('日次レポート送信完了')
 
-        return jsonify({'status': 'ok', 'message': '日次レポートを送信しました'})
+        # 金曜は続けて週次レポートも送る
+        weekly_sent = False
+        if today.weekday() == 4:
+            weekly_text = build_weekly_report_text()
+            if weekly_text:
+                _push_to_admins(weekly_text)
+                weekly_sent = True
+                logger.info('週次レポート送信完了')
+
+        return jsonify({
+            'status': 'ok',
+            'message': '日次レポートを送信しました',
+            'weekly_sent': weekly_sent,
+        })
 
     except Exception as e:
-        logger.error(f'日次レポートエラー: {e}')
+        logger.error(f'日次レポートエラー: {e}', exc_info=True)
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
-@app.route('/weekly', methods=['GET', 'POST'])
-def weekly_report_to_admin():
-    """金曜18:15にcron-job.orgから呼ばれるエンドポイント。
-    今週（月〜金）の全ユーザーの日報サマリーを管理者にプッシュ送信する。"""
-    logger.info('週次レポート送信開始')
+def _this_week_dates() -> tuple[list[str], str]:
+    """今週の月〜金（今日まで）の日付リストと週ラベルを返す"""
+    today    = datetime.now(JST).date()
+    # 今週の月曜日を起点にする
+    monday   = today - timedelta(days=today.weekday())
+    friday   = monday + timedelta(days=4)
 
-    try:
-        today    = datetime.now(JST).date()
-        # 今週の月曜日を起点にする
-        monday   = today - timedelta(days=today.weekday())
-        friday   = monday + timedelta(days=4)
+    # 月〜金の日付リスト（平日のみ）
+    date_strs = []
+    current = monday
+    while current <= min(friday, today):
+        if current.weekday() < 5:
+            date_strs.append(current.strftime('%Y/%m/%d'))
+        current += timedelta(days=1)
 
-        # 月〜金の日付リスト（平日のみ）
-        date_strs = []
-        current = monday
-        while current <= min(friday, today):
-            if current.weekday() < 5:
-                date_strs.append(current.strftime('%Y/%m/%d'))
-            current += timedelta(days=1)
+    week_label = (
+        f'{monday.month}/{monday.day}〜{friday.month}/{friday.day}'
+    )
+    return date_strs, week_label
 
-        week_label = (
-            f'{monday.month}/{monday.day}〜{friday.month}/{friday.day}'
-        )
 
-        # 全日報データを取得
-        records = get_reports_by_date_range(date_strs)
+def _summarize_user_week(name: str, records: list[dict]) -> tuple[int, str, list[dict]]:
+    """1人分の週次集計を返す: (提出日数, 主な活動の要約, その人の日報)"""
+    target = normalize_name(name)
+    user_records = [
+        r for r in records
+        if normalize_name(r.get('ユーザー名')) == target
+    ]
 
-        # 登録ユーザー一覧
-        all_users = get_all_users()
+    # 提出日数（ユニークな日付数）。表記ゆれを吸収してから数える
+    submitted_dates = {
+        d for d in (normalize_date(r.get('日付')) for r in user_records)
+        if d is not None
+    }
 
-        if not all_users:
-            logger.info('登録ユーザーが0名のため週次レポート送信をスキップ')
-            return jsonify({'status': 'ok', 'message': 'ユーザーなし'})
+    # アクション別の回数集計
+    action_counter = Counter(r.get('行動種別', '') for r in user_records)
+    action_summary = ' '.join(
+        f'{ACTION_EMOJI.get(a, "")}{ACTION_SHORT.get(a, a)}({c})'
+        for a, c in action_counter.most_common(3)
+    )
+    return len(submitted_dates), action_summary, user_records
 
-        total_days = len(date_strs)
 
-        lines = [f'📊 週次レポート（{week_label}）\n']
+def build_my_weekly_report_text(name: str) -> str:
+    """本人の今週分（月〜金）のまとめを組み立てて返す。
+    nameはLINEの表示名から取得した本人の名前で、他人の分は参照できない。"""
+    date_strs, week_label = _this_week_dates()
+    total_days = len(date_strs)
+    records    = get_reports_by_date_range(date_strs)
 
-        # ユーザーごとに集計
-        from collections import Counter
-        for user in sorted(all_users, key=lambda u: u['name']):
-            name   = user['name']
-            target = normalize_name(name)
-            user_records = [
-                r for r in records
-                if normalize_name(r.get('ユーザー名')) == target
-            ]
+    submitted_count, action_summary, user_records = _summarize_user_week(
+        name, records
+    )
 
-            # 提出日数（ユニークな日付数）。表記ゆれを吸収してから数える
-            submitted_dates = {
-                d for d in (normalize_date(r.get('日付')) for r in user_records)
-                if d is not None
-            }
-            submitted_count = len(submitted_dates)
+    lines = [f'📊 {name}さんの週次まとめ', week_label, '']
 
-            if submitted_count == 0:
-                lines.append(f'❌ {name}: 提出なし')
-                continue
+    if not user_records:
+        lines.append('今週の日報はまだありません。')
+        return '\n'.join(lines)
 
-            rate = round(submitted_count / total_days * 100)
+    rate = round(submitted_count / total_days * 100) if total_days else 0
+    lines.append(f'提出: {submitted_count}/{total_days}日({rate}%)')
+    if action_summary:
+        lines.append(f'主な活動: {action_summary}')
+    lines.append('')
 
-            # アクション別の回数集計
-            action_counter = Counter(
-                r.get('行動種別', '') for r in user_records
-            )
-            top_actions = action_counter.most_common(3)
-            action_summary = ' '.join(
-                f'{ACTION_EMOJI.get(a, "")}{ACTION_SHORT.get(a, a)}({c})'
-                for a, c in top_actions
-            )
+    # 日ごとの内容
+    by_date: dict[date, dict] = {}
+    for rec in user_records:
+        d = normalize_date(rec.get('日付'))
+        if d is None:
+            continue
+        by_date.setdefault(d, {})[rec.get('午前or午後', '')] = rec
 
-            icon = '✅' if rate >= 80 else '⚠️'
-            lines.append(
-                f'{icon} {name}: {submitted_count}/{total_days}日({rate}%) '
-                f'{action_summary}'
-            )
+    for date_str in date_strs:
+        d = normalize_date(date_str)
+        if d is None or d not in by_date:
+            continue
+        slots      = by_date[d]
+        slot_texts = [
+            f'{slot}:{format_action_label(slots[slot])}'
+            for slot in ['午前', '午後'] if slot in slots
+        ]
+        lines.append(f'{d.month}/{d.day} {" ".join(slot_texts)}')
 
-        # 全体統計
-        all_submitted = {
-            n for n in (normalize_name(r.get('ユーザー名')) for r in records) if n
-        }
-        lines.append('')
+    return '\n'.join(lines)
+
+
+def build_weekly_report_text() -> str | None:
+    """今週（月〜金）の全ユーザーの日報サマリーを組み立てて返す。
+    登録ユーザーが0名の場合はNoneを返す。"""
+    date_strs, week_label = _this_week_dates()
+
+    # 全日報データを取得
+    records = get_reports_by_date_range(date_strs)
+
+    # 登録ユーザー一覧
+    all_users = get_all_users()
+
+    if not all_users:
+        logger.info('登録ユーザーが0名のため週次レポートをスキップ')
+        return None
+
+    total_days = len(date_strs)
+
+    if total_days == 0:
+        logger.info('対象の平日が0日のため週次レポートをスキップ')
+        return None
+
+    lines = [f'📊 週次レポート（{week_label}）\n']
+
+    # ユーザーごとに集計
+    for user in sorted(all_users, key=lambda u: u['name']):
+        name = user['name']
+        submitted_count, action_summary, _ = _summarize_user_week(name, records)
+
+        if submitted_count == 0:
+            lines.append(f'❌ {name}: 提出なし')
+            continue
+
+        rate = round(submitted_count / total_days * 100)
+        icon = '✅' if rate >= 80 else '⚠️'
         lines.append(
-            f'全体: {len(all_submitted)}/{len(all_users)}名が1件以上提出'
+            f'{icon} {name}: {submitted_count}/{total_days}日({rate}%) '
+            f'{action_summary}'
         )
 
-        report_text = '\n'.join(lines)
-        _push_to_admins(report_text)
-        logger.info('週次レポート送信完了')
+    # 全体統計
+    all_submitted = {
+        n for n in (normalize_name(r.get('ユーザー名')) for r in records) if n
+    }
+    lines.append('')
+    lines.append(
+        f'全体: {len(all_submitted)}/{len(all_users)}名が1件以上提出'
+    )
 
-        return jsonify({'status': 'ok', 'message': '週次レポートを送信しました'})
-
-    except Exception as e:
-        logger.error(f'週次レポートエラー: {e}')
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+    return '\n'.join(lines)
 
 # ─────────────────────────────────────
 # LINEイベントハンドラ
@@ -1571,23 +1829,14 @@ def handle_message(event):
 
     try:
         # ──── 日報入力コマンド ────
+        # 午前 → 午後 の順に入力する。送るたびに最初からやり直せる
         if text == '日報入力':
-            quick_reply = QuickReply(items=[
-                QuickReplyItem(action=PostbackAction(
-                    label='午前', data='action=午前リマインダー&time_slot=午前', display_text='午前',
-                )),
-                QuickReplyItem(action=PostbackAction(
-                    label='午後', data='action=午後リマインダー&time_slot=午後', display_text='午後',
-                )),
-            ])
-            with ApiClient(configuration) as api_client:
-                MessagingApi(api_client).reply_message(ReplyMessageRequest(
-                    reply_token=reply_token,
-                    messages=[TextMessage(
-                        text='午前・午後どちらの日報ですか？',
-                        quick_reply=quick_reply,
-                    )],
-                ))
+            start_report_flow(user_id, reply_token)
+            return
+
+        # ──── 週次まとめコマンド（本人の分のみ） ────
+        if text == '週次まとめ':
+            reply_my_weekly_report(user_id, reply_token)
             return
         # ──── 登録コマンド ────
         if text == '登録':
@@ -1819,39 +2068,27 @@ def handle_message(event):
 
         # ──── 自由メモの入力（スキップ可） ────
         if current_state == 'waiting_for_memo':
-            # 「スキップ」の場合はメモなしで保存
+            # 「スキップ」の場合はメモなしで確定
             user_states[user_id]['memo'] = '' if text == 'スキップ' else text
-            summary = build_summary(user_states[user_id], display_name)
-            snap = dict(user_states[user_id])
-            del user_states[user_id]
-            save_and_reply(reply_token, display_name, snap, summary)
+            complete_slot(user_id, reply_token, display_name)
             return
 
         # ──── 移動先の入力 ────
         if current_state == 'waiting_for_destination':
             user_states[user_id]['destination'] = text
-            summary = build_summary(user_states[user_id], display_name)
-            snap = dict(user_states[user_id])
-            del user_states[user_id]
-            save_and_reply(reply_token, display_name, snap, summary)
+            complete_slot(user_id, reply_token, display_name)
             return
 
         # ──── 社内作業内容の入力 ────
         if current_state == 'waiting_for_work_content':
             user_states[user_id]['work_content'] = text
-            summary = build_summary(user_states[user_id], display_name)
-            snap = dict(user_states[user_id])
-            del user_states[user_id]
-            save_and_reply(reply_token, display_name, snap, summary)
+            complete_slot(user_id, reply_token, display_name)
             return
 
         # ──── 工場対応内容の入力 ────
         if current_state == 'waiting_for_factory_content':
             user_states[user_id]['factory_content'] = text
-            summary = build_summary(user_states[user_id], display_name)
-            snap = dict(user_states[user_id])
-            del user_states[user_id]
-            save_and_reply(reply_token, display_name, snap, summary)
+            complete_slot(user_id, reply_token, display_name)
             return
 
     except Exception as e:
@@ -2181,14 +2418,7 @@ def handle_postback(event):
                 ))
             return
 
-        if action in ('午前リマインダー', '午後リマインダー'):
-            flex_msg = create_flex_message(time_slot)
-            with ApiClient(configuration) as api_client:
-                MessagingApi(api_client).reply_message(ReplyMessageRequest(
-                    reply_token=reply_token,
-                    messages=[flex_msg],
-                ))
-            return# ──── 友達追加：後で登録する ────
+        # ──── 友達追加：後で登録する ────
         if action == 'follow_skip':
             reply_text(reply_token, '登録する時は「登録」と送ってください。')
             return
@@ -2287,27 +2517,42 @@ def handle_postback(event):
             reply_text(reply_token, result)
             return
 
-        # ──── 日報入力ボタン ────
-        # アクションに対応する最初の入力待ち状態を取得
+        # ──── 日報入力：開始（18:00の通知ボタン / 「日報入力」コマンド） ────
+        # 押すたびに最初からやり直せる
+        if action == ACTION_START_REPORT:
+            start_report_flow(user_id, reply_token)
+            return
+
+        # ──── 週次まとめ（本人の分のみ） ────
+        if action == ACTION_MY_WEEKLY:
+            reply_my_weekly_report(user_id, reply_token)
+            return
+
+        # ──── 日報入力：午前 or 午後をスキップ ────
+        if action == ACTION_SKIP_SLOT:
+            if not _is_current_slot(user_id, time_slot):
+                # 状態が消えている、または古いボタンを押した場合はやり直す
+                start_report_flow(user_id, reply_token)
+                return
+            skip_slot(user_id, reply_token, get_display_name(user_id))
+            return
+
+        # ──── 日報入力：行動種別の選択 ────
         first_state = ACTION_FIRST_STATE.get(action)
         if not first_state:
             logger.warning(f'未定義のアクション: {action}')
             reply_text(reply_token, '少し待ってからもう一度お試しください')
             return
 
-        # ユーザー状態を初期化
-        user_states[user_id] = {
-            'state':           first_state,
-            'time_slot':       time_slot,
-            'action':          action,
-            'company':         '',
-            'destination':     '',
-            'work_content':    '',
-            'factory_content': '',
-            'memo':            '',
-        }
+        if not _is_current_slot(user_id, time_slot):
+            # 状態が消えている、または古いボタンを押した場合はやり直す
+            start_report_flow(user_id, reply_token)
+            return
 
-        # 最初の質問を送信
+        # 入力中スロットのアクションを確定し、最初の質問へ
+        state = user_states[user_id]
+        state['action'] = action
+        state['state']  = first_state
         reply_text(reply_token, STATE_QUESTION[first_state])
 
     except Exception as e:
