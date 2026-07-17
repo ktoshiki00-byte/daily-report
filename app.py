@@ -130,6 +130,25 @@ OVERTIME_NOTE = '残業などでまだ仕事中の場合は、終わってから
 # postbackのaction名
 ACTION_MY_WEEKLY = 'my_weekly'      # 本人の週次まとめ
 
+# 休暇区分と有給の消化日数（1日あたり）
+LEAVE_SPAN_FULL = '全日休'
+LEAVE_SPAN_AM   = '午前休'
+LEAVE_SPAN_PM   = '午後休'
+LEAVE_SPANS     = {
+    LEAVE_SPAN_FULL: 1.0,
+    LEAVE_SPAN_AM:   0.5,
+    LEAVE_SPAN_PM:   0.5,
+}
+# 半休で日報の入力が不要になるスロット
+LEAVE_SPAN_FREE_SLOT = {
+    LEAVE_SPAN_AM: '午前',
+    LEAVE_SPAN_PM: '午後',
+}
+
+# 会社指定の有給消化日（年末の土曜出勤日に充当する計画的付与）の既定控除日数。
+# 有給管理シートの『指定日控除』が空欄の場合にこの値を使う。
+DEFAULT_PLANNED_LEAVE_DEDUCTION = 5.0
+
 # 登録完了メッセージ（スプレッドシート連携の有無にかかわらず同じ文面を使う）
 REGISTERED_MESSAGE_TEMPLATE = (
     '{name}さんを登録しました！\n'
@@ -205,23 +224,11 @@ ACTION_CONTENT_FIELD = {
 }
 
 # ─────────────────────────────────────
-# ユーザー状態管理（インメモリ）
+# キャッシュ
 # ─────────────────────────────────────
-# Render.com無料プランはシングルワーカーのためインメモリで問題なし
-#
-# 日報の入力はLIFFフォームに移行したため、ここで扱うのは休暇申請フローのみ。
-#
-# 形式:
-# {
-#   user_id: {
-#     'state':       str,   # 現在の入力待ち状態（例: 'leave_reason'）
-#     'leave_type':  str,
-#     'leave_start': str,
-#     'leave_end':   str,
-#     'leave_days':  int,
-#   }
-# }
-user_states: dict = {}
+# 入力待ち状態（user_states）は廃止した。
+# 日報はLIFFフォームで一括送信し、休暇申請はボタンだけで完結するため、
+# 途中状態をサーバーに保持する必要がない（再起動で入力が消えることもない）。
 _display_name_cache: dict = {}
 _DISPLAY_NAME_TTL = 3600
 
@@ -351,17 +358,6 @@ def register_user(user_id: str, display_name: str) -> str:
     today = datetime.now(JST).strftime('%Y/%m/%d')
     append_row_safely(users_sheet, [display_name, user_id, today])
     return REGISTERED_MESSAGE_TEMPLATE.format(name=display_name)
-
-
-def get_all_user_ids() -> list[str]:
-    """登録済み全ユーザーのIDリストを取得する。
-    スプレッドシート連携が無効な場合は空リストを返す。
-
-    usersシートの読み取りは get_all_users() に統一する。
-    get_all_records() は空行で止まるため、usersシートの途中に空行があると
-    それ以降のユーザーに通知が届かなくなる。
-    """
-    return [u['id'] for u in get_all_users()]
 
 
 def save_inquiry(display_name: str, message: str, auto_reply: str):
@@ -741,10 +737,14 @@ def create_help_flex_message() -> FlexMessage:
                 cmd_row('使い方', 'この説明を表示'),
                 {'type': 'separator', 'margin': 'md'},
                 section_header('休暇・有給', '#8E44AD'),
-                cmd_row('休暇申請',   '休暇の申請（管理者が承認します）'),
+                cmd_row('休暇申請',   '全日休・午前休・午後休を申請\n（管理者が承認します）'),
                 cmd_row('有給残日数', '残日数を確認'),
                 cmd_row('申請履歴',   '直近5件を表示'),
                 cmd_row('有給一覧',   '全員の残日数（管理者のみ）'),
+                body_text(
+                    '承認された休暇の日は日報が不要になります'
+                    '（半休は残り半日だけ入力）。',
+                ),
                 {'type': 'separator', 'margin': 'md'},
                 # ── 自動送信スケジュール ──
                 section_header('自動送信スケジュール', '#E67E22'),
@@ -783,26 +783,31 @@ def send_my_weekly_to_all(all_users: list[dict]):
 
 
 def send_reminder_to_all():
-    """登録済み全ユーザーに日報リマインダーをプッシュ送信する"""
+    """登録済み全ユーザーに日報リマインダーをプッシュ送信する。
+    全日休が承認されている人には送らない（半休は日報が必要なので送る）。"""
     try:
-        user_ids = get_all_user_ids()
-        if not user_ids:
+        users = get_all_users()
+        if not users:
             logger.info('登録ユーザーが0名のため送信をスキップ')
             return
 
+        leaves   = get_approved_leaves(datetime.now(JST).date())
         flex_msg = create_reminder_flex_message()
 
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
-            for uid in user_ids:
+            for user in users:
+                if leaves.get(normalize_name(user['name'])) == LEAVE_SPAN_FULL:
+                    logger.info(f'全日休のため通知をスキップ: {user["name"]}')
+                    continue
                 try:
                     line_bot_api.push_message(PushMessageRequest(
-                        to=uid,
+                        to=user['id'],
                         messages=[flex_msg],
                     ))
-                    logger.info(f'プッシュ送信完了: {uid}')
+                    logger.info(f'プッシュ送信完了: {user["id"]}')
                 except Exception as e:
-                    logger.error(f'プッシュ送信失敗 ({uid}): {e}')
+                    logger.error(f'プッシュ送信失敗 ({user["id"]}): {e}')
 
     except Exception as e:
         logger.error(f'send_flex_to_all エラー: {e}')
@@ -1121,21 +1126,30 @@ def _calculate_leave_entitlement(hire_date: date) -> int:
 
 
 def get_leave_balance_sheet():
-    """有給管理シートを取得または作成する"""
+    """有給管理シートを取得または作成する。
+
+    残日数 = 付与日数 − 指定日控除 − 申請消化 で自動計算する（承認時に書き戻す）。
+    繰越分は付与日数に含める運用。
+    """
     spreadsheet = get_spreadsheet()
     return get_or_create_sheet(
         spreadsheet, '有給管理',
-        ['名前', 'LINE_USER_ID', '入社日', '付与日数', '使用日数', '残日数', '最終付与日'],
+        ['名前', 'LINE_USER_ID', '入社日', '付与日数', '指定日控除',
+         '申請消化', '残日数', '最終付与日'],
     )
 
 
 def get_leave_application_sheet():
-    """休暇申請シートを取得または作成する"""
+    """休暇申請シートを取得または作成する。
+
+    『理由』は入力を廃止したが、既存データと列位置を保つため列は残す（常に空）。
+    『休暇区分』は後から追加したため末尾に置く。空欄の既存行は全日休とみなす。
+    """
     spreadsheet = get_spreadsheet()
     return get_or_create_sheet(
         spreadsheet, '休暇申請',
         ['申請日時', '名前', '申請種別', '開始日', '終了日', '日数', '理由',
-         'ステータス', '承認者', '承認日時'],
+         'ステータス', '承認者', '承認日時', '休暇区分'],
     )
 
 
@@ -1167,20 +1181,32 @@ def _read_sheet_rows(sheet) -> list[dict]:
     return rows
 
 
-def _to_int(value, default: int = 0) -> int:
-    """'3'、'3.0'、3.0、'' などを整数に変換する。変換できなければdefault"""
+def _sheet_col(sheet, header: str) -> int:
+    """ヘッダー名から列番号（1始まり）を返す。見つからなければ0。
+
+    列番号を直書きすると、列を足したときに別の列を壊す。名前で引く。
+    """
+    all_values = sheet.get_all_values()
+    if not all_values:
+        return 0
     try:
-        return int(float(str(value).strip()))
+        return all_values[0].index(header) + 1
+    except ValueError:
+        logger.error(f'列が見つかりません: {header!r}')
+        return 0
+
+
+def _to_float(value, default: float = 0.0) -> float:
+    """'3'、'0.5'、3.0、'' などを小数に変換する。変換できなければdefault"""
+    try:
+        return float(str(value).strip())
     except (ValueError, TypeError):
         return default
 
 
-def _get_leave_balance(user_id: str) -> dict | None:
-    """有給管理シートからユーザーの有給情報を取得する。未登録なら None を返す"""
-    for r in _read_sheet_rows(get_leave_balance_sheet()):
-        if r.get('LINE_USER_ID') == user_id:
-            return {'row': r['_row'], 'data': r}
-    return None
+def _fmt_days(value: float) -> str:
+    """日数を表示用に整形する。1.0→'1'、0.5→'0.5'、12.5→'12.5'"""
+    return str(int(value)) if float(value).is_integer() else str(value)
 
 
 def _find_leave_balance_by_name(name: str) -> dict | None:
@@ -1195,17 +1221,21 @@ def _find_leave_balance_by_name(name: str) -> dict | None:
 def _calc_leave_balance(name: str) -> dict:
     """有給管理シートから付与日数・使用日数・残日数を読む。
 
-    シートの『残日数』列を正とする。承認時はこの値から申請日数を引くため、
-    繰越分や手動調整をそのまま反映できる（管理者がシートを直せばそれが使われる）。
-    残日数が空欄の場合のみ、入社日から算出した付与日数で補う。
+    残日数 = 付与日数 − 指定日控除 − 申請消化 で計算する。
+    残日数列はこの計算結果を書き戻したものなので、直接編集しても次の承認で
+    上書きされる。調整は付与日数（繰越分を含む）で行う。
 
-    戻り値: {'found', 'known', 'row', 'granted', 'used', 'remaining', 'problem'}
+    付与日数が空欄の場合のみ、入社日から自動算出する。
+    指定日控除が空欄の場合は既定値（5日）を使う。
+
+    戻り値: {'found', 'known', 'row', 'granted', 'deduction', 'used',
+             'remaining', 'problem'}
       found : 有給管理シートに行があるか
       known : 残日数を確定できたか（Falseなら承認時の減算はできない）
       problem: 確定できた場合でも注意があれば入る
     """
-    result = {'found': False, 'known': False, 'row': 0, 'granted': 0,
-              'used': 0, 'remaining': 0, 'problem': ''}
+    result = {'found': False, 'known': False, 'row': 0, 'granted': 0.0,
+              'deduction': 0.0, 'used': 0.0, 'remaining': 0.0, 'problem': ''}
 
     entry = _find_leave_balance_by_name(name)
     if entry is None:
@@ -1216,40 +1246,45 @@ def _calc_leave_balance(name: str) -> dict:
     result['row']   = entry['row']
     d = entry['data']
 
-    result['used']    = _to_int(d.get('使用日数'))
-    result['granted'] = _to_int(d.get('付与日数'))
+    result['used'] = _to_float(d.get('申請消化'))
 
-    if str(d.get('残日数', '')).strip():
-        result['remaining'] = _to_int(d.get('残日数'))
-        result['known']     = True
-        return result
+    # 指定日控除。空欄なら既定値
+    if str(d.get('指定日控除', '')).strip():
+        result['deduction'] = _to_float(d.get('指定日控除'))
+    else:
+        result['deduction'] = DEFAULT_PLANNED_LEAVE_DEDUCTION
 
-    # 残日数が空欄。付与日数か入社日から補って初期値とする
-    if not str(d.get('付与日数', '')).strip():
+    # 付与日数。空欄なら入社日から算出
+    if str(d.get('付与日数', '')).strip():
+        result['granted'] = _to_float(d.get('付与日数'))
+    else:
         hire_date = normalize_date(str(d.get('入社日', '')).strip())
         if hire_date is None:
-            result['problem'] = '残日数・付与日数・入社日がいずれも未設定'
+            result['problem'] = '付与日数と入社日のどちらも未設定'
             return result
-        result['granted'] = _calculate_leave_entitlement(hire_date)
+        result['granted'] = float(_calculate_leave_entitlement(hire_date))
+        result['problem'] = '付与日数が空欄のため入社日から算出'
 
-    result['remaining'] = result['granted'] - result['used']
-    result['known']     = True
-    result['problem']   = '残日数が空欄のため付与日数から算出'
+    result['remaining'] = (
+        result['granted'] - result['deduction'] - result['used']
+    )
+    result['known'] = True
     return result
 
 
 def _submit_leave_application(
-    display_name: str, leave_type: str,
-    start_date: str, end_date: str, days: int, reason: str,
+    display_name: str, leave_type: str, span: str,
+    start_date: str, end_date: str, days: float,
 ) -> int:
-    """休暇申請シートに申請行を追加し、挿入した行番号を返す"""
+    """休暇申請シートに申請行を追加し、挿入した行番号を返す。
+    『理由』列は入力を廃止したため常に空で書き込む（列位置は保つ）。"""
     sheet   = get_leave_application_sheet()
     now_str = datetime.now(JST).strftime('%Y/%m/%d %H:%M')
     # 実際に書き込んだ行番号を使う。get_all_records()の件数から計算すると
     # 空行で件数が途切れ、承認時に別の行を書き換えてしまう
     return append_row_safely(sheet, [now_str, display_name, leave_type,
-                                     start_date, end_date, days, reason,
-                                     '申請中', '', ''])
+                                     start_date, end_date, days, '',
+                                     '申請中', '', '', span])
 
 
 def _build_leave_balance_list() -> str:
@@ -1264,8 +1299,10 @@ def _build_leave_balance_list() -> str:
         lines.append('有給管理シートにデータがありません。')
         lines.append('')
         lines.append('シートに直接入力してください（1行1名）:')
-        lines.append('　名前 / LINE_USER_ID / 入社日 / 付与日数 / 使用日数 / 残日数')
-        lines.append('　※ 入社日（例 2024/04/01）を入れれば付与日数は自動計算されます')
+        lines.append('　名前 / LINE_USER_ID / 入社日 / 付与日数 /')
+        lines.append('　指定日控除 / 申請消化 / 残日数')
+        lines.append('　※ 残日数 = 付与日数 − 指定日控除 − 申請消化（自動計算）')
+        lines.append('　※ 繰越分は付与日数に含めてください')
         return '\n'.join(lines)
 
     problems = []
@@ -1281,8 +1318,10 @@ def _build_leave_balance_list() -> str:
             continue
         mark = '⚠️' if bal['remaining'] <= 0 else '・'
         lines.append(
-            f'{mark} {name}: 残 {bal["remaining"]}日'
-            f'（付与 {bal["granted"]} / 使用 {bal["used"]}）'
+            f'{mark} {name}: 残 {_fmt_days(bal["remaining"])}日'
+            f'（付与 {_fmt_days(bal["granted"])}'
+            f' − 指定日 {_fmt_days(bal["deduction"])}'
+            f' − 消化 {_fmt_days(bal["used"])}）'
         )
         if bal['problem']:
             problems.append(f'{name}: {bal["problem"]}')
@@ -1303,8 +1342,9 @@ def _build_leave_balance_list() -> str:
         for p in problems:
             lines.append(f'　・{p}')
         lines.append('')
-        lines.append('有給管理シートの「入社日」（例 2024/04/01）を入れれば'
-                     '付与日数は自動計算されます。')
+        lines.append('有給管理シートの「付与日数」を入れてください'
+                     '（繰越分を含めた日数）。空欄の場合は入社日から'
+                     '自動計算します。')
 
     return '\n'.join(lines)
 
@@ -1322,8 +1362,8 @@ def _format_leave_period(start_date: str, end_date: str) -> str:
 
 
 def _notify_admins_leave(
-    display_name: str, leave_type: str,
-    start_date: str, end_date: str, days: int, reason: str, row_num: int,
+    display_name: str, leave_type: str, span: str,
+    start_date: str, end_date: str, days: float, row_num: int,
 ):
     """全管理者に休暇申請通知を送信する（承認・却下ボタン付き）"""
     admin_ids = get_admin_ids()
@@ -1333,20 +1373,23 @@ def _notify_admins_leave(
     msg_text = (
         f'休暇申請が届きました\n\n'
         f'申請者：{display_name}\n'
-        f'種別：{leave_type}\n'
-        f'期間：{_format_leave_period(start_date, end_date)}（{days}日）\n'
-        f'理由：{reason}'
+        f'種別：{leave_type}（{span}）\n'
+        f'日付：{_format_leave_period(start_date, end_date)}'
     )
+    if leave_type == '有給':
+        msg_text += f'\n消化：{_fmt_days(days)}日'
 
     # 有給は現在の残日数を添える。足りない場合はその場で分かるようにする
     if leave_type == '有給':
         bal = _calc_leave_balance(display_name)
-        if bal['problem']:
+        if not bal['known']:
             msg_text += f'\n\n残日数：不明（{bal["problem"]}）'
         else:
-            msg_text += f'\n\n現在の残日数：{bal["remaining"]}日'
+            msg_text += f'\n現在の残日数：{_fmt_days(bal["remaining"])}日'
             if bal['remaining'] < days:
-                msg_text += f'\n⚠️ 申請日数（{days}日）が残日数を超えています'
+                msg_text += (
+                    f'\n⚠️ 消化日数（{_fmt_days(days)}日）が残日数を超えています'
+                )
     quick_reply = QuickReply(items=[
         QuickReplyItem(action=PostbackAction(
             label='承認',
@@ -1371,6 +1414,82 @@ def _notify_admins_leave(
                 logger.error(f'申請通知送信失敗 ({uid}): {e}')
 
 
+def get_approved_leaves(target_date: date) -> dict[str, str]:
+    """指定日に承認済みの休暇を {正規化した名前: 休暇区分} で返す。
+
+    承認済み（ステータス='承認'）のみが対象。申請中・却下は含めない。
+    日報の提出対象から外す判定に使う。
+    """
+    if not SHEETS_ENABLED:
+        return {}
+    result: dict[str, str] = {}
+    try:
+        rows = _read_sheet_rows(get_leave_application_sheet())
+    except Exception:
+        logger.error('休暇申請シートの読み取りに失敗', exc_info=True)
+        return {}
+
+    for r in rows:
+        if r.get('ステータス') != '承認':
+            continue
+        start = normalize_date(r.get('開始日'))
+        end   = normalize_date(r.get('終了日')) or start
+        if start is None or end is None:
+            continue
+        if not (start <= target_date <= end):
+            continue
+        name = normalize_name(r.get('名前'))
+        if not name:
+            continue
+        span = (r.get('休暇区分') or '').strip() or LEAVE_SPAN_FULL
+        # 同じ日に複数の承認がある場合は全日休を優先する
+        if result.get(name) == LEAVE_SPAN_FULL:
+            continue
+        result[name] = span
+    return result
+
+
+def _finalize_leave_application(
+    reply_token: str, user_id: str, leave_type: str, span: str,
+    start_date: str, end_date: str, days: float,
+):
+    """休暇申請を確定して記録し、管理者に通知して本人に受付を返す"""
+    display_name = get_display_name(user_id)
+    period       = _format_leave_period(start_date, end_date)
+
+    if not SHEETS_ENABLED:
+        logger.info(f'[SHEETS無効] 休暇申請: {display_name} / {leave_type} / {span}')
+        reply_text(reply_token, '申請を受け付けました。')
+        return
+
+    try:
+        row_num = _submit_leave_application(
+            display_name, leave_type, span, start_date, end_date, days
+        )
+    except Exception:
+        logger.error(f'休暇申請の保存に失敗: {display_name}', exc_info=True)
+        reply_text(reply_token, '⚠️ 申請の保存に失敗しました。もう一度お試しください。')
+        return
+
+    try:
+        _notify_admins_leave(
+            display_name, leave_type, span, start_date, end_date, days, row_num
+        )
+    except Exception:
+        logger.error('管理者への申請通知に失敗', exc_info=True)
+
+    lines = [
+        '申請を受け付けました。',
+        f'種別：{leave_type}（{span}）',
+        f'日付：{period}',
+    ]
+    if leave_type == '有給':
+        lines.append(f'消化：{_fmt_days(days)}日')
+    lines.append('')
+    lines.append('承認後にLINEでお知らせします。')
+    reply_text(reply_token, '\n'.join(lines))
+
+
 def _process_leave_decision(row_num: int, admin_id: str, approved: bool) -> str:
     """休暇申請の承認・却下を処理し、本人に通知する。結果メッセージを返す"""
     try:
@@ -1387,10 +1506,9 @@ def _process_leave_decision(row_num: int, admin_id: str, approved: bool) -> str:
         app_type   = row_data[2]
         start_date = row_data[3]
         end_date   = row_data[4]
-        try:
-            app_days = int(float(row_data[5]))
-        except (ValueError, IndexError):
-            app_days = 0
+        app_days   = _to_float(row_data[5] if len(row_data) > 5 else 0)
+        # 休暇区分は後から追加した列。空欄の既存行は全日休とみなす
+        span = (row_data[10] if len(row_data) > 10 else '') or LEAVE_SPAN_FULL
 
         new_status = '承認' if approved else '却下'
         admin_name = get_display_name(admin_id)
@@ -1414,28 +1532,38 @@ def _process_leave_decision(row_num: int, admin_id: str, approved: bool) -> str:
                 )
                 admin_msg += f'\n⚠️ 残日数は更新できませんでした（{bal["problem"]}）'
             else:
-                # シートの値から申請日数を引く（繰越や手動調整を保つ）
+                # 申請消化に加算し、残日数を計算し直して書き戻す
                 new_used      = bal['used'] + app_days
-                new_remaining = bal['remaining'] - app_days
+                new_remaining = bal['granted'] - bal['deduction'] - new_used
                 bal_sheet = get_leave_balance_sheet()
-                bal_sheet.update_cell(bal['row'], 5, new_used)
-                bal_sheet.update_cell(bal['row'], 6, new_remaining)
-                remaining_note = f'\n残り{new_remaining}日です。'
-                admin_msg += f'\n{app_name}さんの残日数：{new_remaining}日'
-                if new_remaining < 0:
-                    admin_msg += '\n⚠️ 残日数がマイナスになっています'
+                used_col  = _sheet_col(bal_sheet, '申請消化')
+                rem_col   = _sheet_col(bal_sheet, '残日数')
+                if used_col and rem_col:
+                    bal_sheet.update_cell(bal['row'], used_col, new_used)
+                    bal_sheet.update_cell(bal['row'], rem_col, new_remaining)
+                    remaining_note = f'\n残り{_fmt_days(new_remaining)}日です。'
+                    admin_msg += (
+                        f'\n{app_name}さんの残日数：{_fmt_days(new_remaining)}日'
+                    )
+                    if new_remaining < 0:
+                        admin_msg += '\n⚠️ 残日数がマイナスになっています'
+                else:
+                    logger.error('有給管理シートの列が見つかりません')
+                    admin_msg += '\n⚠️ 残日数は更新できませんでした（シートの列が不正）'
 
         # 申請者に結果を通知
+        # 全日休は種別のみ（例「7/25の有給」）、半休は区分を添える（例「7/25の午前休」）
+        label = app_type if span == LEAVE_SPAN_FULL else f'{app_type}の{span}'
         applicant_id = _get_user_id_by_name(app_name)
         if applicant_id:
             if approved:
                 notify_text = (
-                    f'{period}の{app_type}が承認されました。{remaining_note}\n'
+                    f'{period}の{label}が承認されました。{remaining_note}\n'
                     f'承認者：{admin_name}'
                 )
             else:
                 notify_text = (
-                    f'{period}の{app_type}が却下されました。\n'
+                    f'{period}の{label}が却下されました。\n'
                     f'担当者にご確認ください。'
                 )
             try:
@@ -1650,6 +1778,32 @@ def liff_report_form():
     )
 
 
+@app.route('/liff/report/context', methods=['POST'])
+def liff_report_context():
+    """フォームの初期表示に必要な情報を返す。
+    当日に承認済みの休暇があれば、その区分を返して入力不要と分かるようにする。"""
+    if not LIFF_ENABLED:
+        return jsonify({'ok': False}), 503
+
+    payload = verify_id_token((request.get_json(silent=True) or {}).get('idToken', ''))
+    if not payload or not payload.get('sub'):
+        return jsonify({'ok': False, 'message': 'ログイン情報を確認できませんでした。'}), 401
+
+    try:
+        display_name = get_display_name(payload['sub'])
+    except Exception:
+        display_name = payload.get('name', '')
+
+    leaves = get_approved_leaves(datetime.now(JST).date())
+    span   = leaves.get(normalize_name(display_name), '')
+    return jsonify({
+        'ok': True,
+        'name': display_name,
+        'leave': span,                                   # '' / 全日休 / 午前休 / 午後休
+        'freeSlot': LEAVE_SPAN_FREE_SLOT.get(span, ''),  # 入力不要なスロット
+    })
+
+
 @app.route('/liff/report/submit', methods=['POST'])
 def liff_report_submit():
     """日報入力フォームからの送信を受け取り、日報シートに保存する。
@@ -1762,47 +1916,86 @@ def daily_report_to_admin():
             logger.info('登録ユーザーが0名のため日次レポート送信をスキップ')
             return jsonify({'status': 'ok', 'message': 'ユーザーなし'})
 
-        # ユーザーごとに日報を整理
-        lines = [f'📋 {date_label}の日報レポート\n']
+        # 承認済みの休暇。全日休はそもそも日報が不要、半休は片方だけでよい
+        leaves = get_approved_leaves(today)
 
         # 提出判定は表記ゆれを吸収した名前で行い、表示にはシート上の名前を使う
-        submitted_users = set()
-        by_user = {}
+        by_user: dict[str, dict] = {}
         for rec in records:
             name = rec.get('ユーザー名', '')
-            if name:
-                submitted_users.add(normalize_name(name))
-                by_user.setdefault(name, []).append(rec)
+            if not name:
+                continue
+            key = normalize_name(name)
+            by_user.setdefault(key, {'name': name, 'recs': []})['recs'].append(rec)
 
-        # 提出済みユーザー
-        for name in sorted(by_user.keys()):
-            user_records = by_user[name]
-            slot_texts = []
-            for rec in sorted(user_records, key=lambda r: r.get('午前or午後', '')):
+        def slot_summary(recs: list[dict]) -> str:
+            parts = []
+            for rec in sorted(recs, key=lambda r: r.get('午前or午後', '')):
                 slot  = rec.get('午前or午後', '')
                 label = format_action_label(rec, with_emoji=True)
-                slot_texts.append(f'{slot}:{label}')
-            lines.append(f'✅ {name}')
-            lines.append(f'  {" / ".join(slot_texts)}')
+                parts.append(f'{slot}:{label}')
+            return ' / '.join(parts)
+
+        on_leave, submitted, not_input = [], [], []
+        for u in sorted(all_users, key=lambda x: x['name']):
+            key  = normalize_name(u['name'])
+            span = leaves.get(key)
+
+            if span == LEAVE_SPAN_FULL:
+                on_leave.append(u['name'])
+                by_user.pop(key, None)
+                continue
+
+            entry = by_user.pop(key, None)
+            recs  = entry['recs'] if entry else []
+            slots = {r.get('午前or午後', '') for r in recs}
+
+            # 半休の日は、休んでいない側のスロットだけを入力対象にする
+            if span in LEAVE_SPAN_FREE_SLOT:
+                required = {'午前', '午後'} - {LEAVE_SPAN_FREE_SLOT[span]}
+            else:
+                required = {'午前', '午後'}
+
+            note = f'（{span}）' if span else ''
+            if slots & required:
+                submitted.append(f'✅ {u["name"]}{note}\n  {slot_summary(recs)}')
+            else:
+                not_input.append(f'{u["name"]}{note}')
+
+        # usersシートにいないが日報がある人（退職者など）も落とさず表示する
+        for entry in by_user.values():
+            submitted.append(f'✅ {entry["name"]}\n  {slot_summary(entry["recs"])}')
+
+        # ユーザーごとに日報を整理
+        lines = [f'📋 {date_label}の日報レポート\n']
+        lines.extend(submitted)
+
+        if on_leave:
+            lines.append('')
+            lines.append('🏖 休暇')
+            for name in on_leave:
+                lines.append(f'  ・{name}')
 
         # 未入力ユーザー。締切（24時）前の集計のため「未提出」とは断定せず、
         # 集計時点で未入力であることを示すにとどめる
-        not_submitted = [
-            u['name'] for u in all_users
-            if normalize_name(u['name']) not in submitted_users
-        ]
-        if not_submitted:
+        if not_input:
             lines.append('')
             lines.append(f'⚠️ {now_label}時点で未入力')
-            for name in not_submitted:
+            for name in not_input:
                 lines.append(f'  ・{name}')
 
-        # 統計
+        # 統計。全日休の人は入力対象から外す
+        target = len(all_users) - len(on_leave)
+        done   = target - len(not_input)
         lines.append('')
-        lines.append(
-            f'入力済み: {len(submitted_users)}/{len(all_users)}名 '
-            f'({round(len(submitted_users)/len(all_users)*100)}%)'
-        )
+        if target > 0:
+            lines.append(
+                f'入力済み: {done}/{target}名 ({round(done / target * 100)}%)'
+            )
+        else:
+            lines.append('本日は全員休暇です')
+        if on_leave:
+            lines.append(f'（休暇 {len(on_leave)}名を除く）')
         lines.append(DEADLINE_NOTE)
 
         report_text = '\n'.join(lines)
@@ -2144,9 +2337,11 @@ def handle_message(event):
             reply_text(
                 reply_token,
                 f'{display_name}さんの有給情報\n\n'
-                f'付与日数：{bal["granted"]}日\n'
-                f'使用日数：{bal["used"]}日\n'
-                f'残日数：{bal["remaining"]}日'
+                f'付与日数：{_fmt_days(bal["granted"])}日\n'
+                f'指定日控除：{_fmt_days(bal["deduction"])}日\n'
+                f'申請消化：{_fmt_days(bal["used"])}日\n'
+                f'━━━━━━━━━━━\n'
+                f'残日数：{_fmt_days(bal["remaining"])}日'
                 f'{next_info}'
             )
             return
@@ -2167,85 +2362,58 @@ def handle_message(event):
             if not SHEETS_ENABLED:
                 reply_text(reply_token, 'スプレッドシートが未設定のため確認できません。')
                 return
-            display_name  = get_display_name(user_id)
-            app_sheet     = get_leave_application_sheet()
-            records       = app_sheet.get_all_records()
-            user_records  = [r for r in records if r.get('名前') == display_name]
-            recent        = user_records[-5:]
+            display_name = get_display_name(user_id)
+            target       = normalize_name(display_name)
+            user_records = [
+                r for r in _read_sheet_rows(get_leave_application_sheet())
+                if normalize_name(r.get('名前')) == target
+            ]
+            recent = user_records[-5:]
             if not recent:
                 reply_text(reply_token, '申請履歴がありません。')
                 return
             lines = ['申請履歴（直近5件）\n']
             for r in reversed(recent):
+                span   = (r.get('休暇区分') or '').strip() or LEAVE_SPAN_FULL
+                period = _format_leave_period(r.get('開始日', ''), r.get('終了日', ''))
                 lines.append(
-                    f'[{r.get("ステータス", "?")}] {r.get("申請種別", "?")} '
-                    f'{r.get("開始日", "?")}〜{r.get("終了日", "?")}（{r.get("日数", "?")}日）'
+                    f'[{r.get("ステータス", "?")}] {r.get("申請種別", "?")}'
+                    f'（{span}）{period}'
                 )
             reply_text(reply_token, '\n'.join(lines))
             return
 
-        # ──── ユーザー状態を確認 ────
-        state = user_states.get(user_id)
+        # ──── コマンド以外のメッセージ → 問い合わせとして処理 ────
+        # 日報はLIFFフォーム、休暇申請はボタンのみで完結するため、
+        # 入力待ち状態（user_states）は使わない
+        display_name = get_display_name(user_id)
 
-        if state is None:
-            # 日報フロー外のメッセージ → 問い合わせとして処理
-            display_name = get_display_name(user_id)
+        # キーワードマッチング（先頭のルールを優先）
+        auto_reply = None
+        for keywords, reply_msg in INQUIRY_KEYWORDS:
+            if any(kw in text for kw in keywords):
+                auto_reply = reply_msg
+                break
 
-            # キーワードマッチング（先頭のルールを優先）
-            auto_reply = None
-            for keywords, reply_msg in INQUIRY_KEYWORDS:
-                if any(kw in text for kw in keywords):
-                    auto_reply = reply_msg
-                    break
-
-            if auto_reply is None:
-                # どのキーワードにもマッチしない → 管理者に転送して送信者に通知
-                forward_text = (
-                    f'【スタッフからの質問】\n'
-                    f'送信者：{display_name}\n'
-                    f'内容：{text}'
-                )
-                try:
-                    _push_to_admins(forward_text)
-                except Exception as e:
-                    logger.error(f'管理者転送エラー: {e}')
-                reply_text(reply_token, 'メッセージを管理者に転送しました')
-                save_inquiry(display_name, text, 'メッセージを管理者に転送しました')
-                return
-
-            # キーワードマッチ：スプレッドシートに記録してユーザーに自動返信
-            save_inquiry(display_name, text, auto_reply)
-            reply_text(reply_token, auto_reply)
-
-            return
-
-        current_state = state['state']
-        display_name  = get_display_name(user_id)
-
-        # ──── 休暇申請：理由の入力 ────
-        if current_state == 'leave_reason':
-            leave_type = state.get('leave_type', '')
-            start_date = state.get('leave_start', '')
-            end_date   = state.get('leave_end', '')
-            days       = state.get('leave_days', 0)
-            reason     = text
-            del user_states[user_id]
-            if SHEETS_ENABLED:
-                row_num = _submit_leave_application(
-                    display_name, leave_type, start_date, end_date, days, reason
-                )
-                _notify_admins_leave(
-                    display_name, leave_type, start_date, end_date, days, reason, row_num
-                )
-            reply_text(
-                reply_token,
-                f'申請を受け付けました。\n'
-                f'種別：{leave_type}\n'
-                f'期間：{start_date}〜{end_date}（{days}日）\n'
-                f'理由：{reason}\n\n'
-                f'承認後にLINEでお知らせします。'
+        if auto_reply is None:
+            # どのキーワードにもマッチしない → 管理者に転送して送信者に通知
+            forward_text = (
+                f'【スタッフからの質問】\n'
+                f'送信者：{display_name}\n'
+                f'内容：{text}'
             )
+            try:
+                _push_to_admins(forward_text)
+            except Exception as e:
+                logger.error(f'管理者転送エラー: {e}')
+            reply_text(reply_token, 'メッセージを管理者に転送しました')
+            save_inquiry(display_name, text, 'メッセージを管理者に転送しました')
             return
+
+        # キーワードマッチ：スプレッドシートに記録してユーザーに自動返信
+        save_inquiry(display_name, text, auto_reply)
+        reply_text(reply_token, auto_reply)
+        return
 
     except Exception as e:
         logger.error(f'メッセージ処理エラー: {e}')
@@ -2583,9 +2751,36 @@ def handle_postback(event):
         if action == 'leave_type_select':
             leave_type = data_params.get('type', '')
             quick_reply = QuickReply(items=[
+                QuickReplyItem(action=PostbackAction(
+                    label=span,
+                    data=f'action=leave_span_select&type={leave_type}&span={span}',
+                    display_text=span,
+                )) for span in LEAVE_SPANS
+            ])
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message(ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[TextMessage(
+                        text=f'【{leave_type}】\n休暇の区分を選んでください',
+                        quick_reply=quick_reply,
+                    )],
+                ))
+            return
+
+        # ──── 休暇申請：休暇区分の選択後 ────
+        if action == 'leave_span_select':
+            leave_type = data_params.get('type', '')
+            span       = data_params.get('span', '')
+            if span not in LEAVE_SPANS:
+                reply_text(reply_token, 'もう一度「休暇申請」からやり直してください。')
+                return
+            # 半休は単日のみ。全日休だけ開始日→終了日の順に聞く
+            label = '日付を選んでください' if span != LEAVE_SPAN_FULL \
+                else '開始日を選んでください'
+            quick_reply = QuickReply(items=[
                 QuickReplyItem(action=DatetimePickerAction(
-                    label='開始日を選ぶ',
-                    data=f'action=leave_start_selected&type={leave_type}',
+                    label='日付を選ぶ',
+                    data=f'action=leave_start_selected&type={leave_type}&span={span}',
                     mode='date',
                 ))
             ])
@@ -2593,7 +2788,7 @@ def handle_postback(event):
                 MessagingApi(api_client).reply_message(ReplyMessageRequest(
                     reply_token=reply_token,
                     messages=[TextMessage(
-                        text=f'【{leave_type}】\n開始日を選んでください',
+                        text=f'【{leave_type}／{span}】\n{label}',
                         quick_reply=quick_reply,
                     )],
                 ))
@@ -2602,15 +2797,26 @@ def handle_postback(event):
         # ──── 休暇申請：開始日選択後 ────
         if action == 'leave_start_selected':
             leave_type = data_params.get('type', '')
+            span       = data_params.get('span', LEAVE_SPAN_FULL)
             start_str  = (event.postback.params or {}).get('date', '')
             if not start_str:
                 reply_text(reply_token, '日付の取得に失敗しました。もう一度お試しください。')
                 return
             start_date = start_str.replace('-', '/')
+
+            # 半休は単日で確定。終了日は聞かない
+            if span != LEAVE_SPAN_FULL:
+                _finalize_leave_application(
+                    reply_token, user_id, leave_type, span,
+                    start_date, start_date, LEAVE_SPANS[span],
+                )
+                return
+
             quick_reply = QuickReply(items=[
                 QuickReplyItem(action=DatetimePickerAction(
                     label='終了日を選ぶ',
-                    data=f'action=leave_end_selected&type={leave_type}&start={start_date}',
+                    data=(f'action=leave_end_selected&type={leave_type}'
+                          f'&span={span}&start={start_date}'),
                     mode='date',
                 ))
             ])
@@ -2624,7 +2830,7 @@ def handle_postback(event):
                 ))
             return
 
-        # ──── 休暇申請：終了日選択後 ────
+        # ──── 休暇申請：終了日選択後（全日休のみ） ────
         if action == 'leave_end_selected':
             leave_type = data_params.get('type', '')
             start_date = data_params.get('start', '')
@@ -2638,18 +2844,10 @@ def handle_postback(event):
             if end_d < start_d:
                 reply_text(reply_token, '終了日は開始日より後の日付を選んでください。')
                 return
-            days = (end_d - start_d).days + 1
-            user_states[user_id] = {
-                'state':       'leave_reason',
-                'leave_type':  leave_type,
-                'leave_start': start_date,
-                'leave_end':   end_date,
-                'leave_days':  days,
-            }
-            reply_text(
-                reply_token,
-                f'休暇理由を入力してください。\n'
-                f'（{leave_type} {start_date}〜{end_date}、{days}日間）'
+            days = float((end_d - start_d).days + 1)
+            _finalize_leave_application(
+                reply_token, user_id, leave_type, LEAVE_SPAN_FULL,
+                start_date, end_date, days,
             )
             return
 

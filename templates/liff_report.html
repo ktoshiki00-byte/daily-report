@@ -85,6 +85,19 @@
   }
   textarea { min-height: 88px; resize: vertical; }
   .hidden { display: none; }
+  /* 休暇のため入力不要な部分 */
+  .leave-note {
+    margin: 0 0 8px;
+    padding: 10px 12px;
+    background: #eef4fb;
+    border-left: 4px solid var(--pm);
+    border-radius: 6px;
+    font-size: 14px;
+    color: #33506e;
+  }
+  .card.on-leave .choices,
+  .card.on-leave .place,
+  .card.on-leave .content { display: none; }
   footer {
     position: fixed;
     left: 0; right: 0; bottom: 0;
@@ -109,10 +122,10 @@
   #msg.ng { color: var(--ng); }
   #msg.ok { color: var(--ok); font-weight: bold; }
   /* 完了画面 */
-  #done { padding: 64px 24px; text-align: center; }
-  #done .mark { font-size: 56px; }
-  #done h2 { margin: 12px 0 4px; }
-  #done p { color: var(--sub); font-size: 14px; }
+  #done, #on-leave { padding: 64px 24px; text-align: center; }
+  #done .mark, #on-leave .mark { font-size: 56px; }
+  #done h2, #on-leave h2 { margin: 12px 0 4px; }
+  #done p, #on-leave p { color: var(--sub); font-size: 14px; }
 </style>
 </head>
 <body>
@@ -129,6 +142,7 @@
 
   <section class="card am" data-slot="am">
     <h2>午前</h2>
+    <p class="leave-note hidden"></p>
     <label>行動種別</label>
     <div class="choices"></div>
     <div class="place hidden">
@@ -143,6 +157,7 @@
 
   <section class="card pm" data-slot="pm">
     <h2>午後</h2>
+    <p class="leave-note hidden"></p>
     <label>行動種別</label>
     <div class="choices"></div>
     <div class="place hidden">
@@ -172,6 +187,12 @@
   <p>この画面は自動で閉じます</p>
 </div>
 
+<div id="on-leave" class="hidden">
+  <div class="mark">🏖</div>
+  <h2>本日は休暇です</h2>
+  <p>日報の入力は不要です。ゆっくりお休みください。</p>
+</div>
+
 <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
 <script>
   const LIFF_ID       = {{ liff_id | tojson }};
@@ -182,6 +203,8 @@
 
   const $ = (sel, root = document) => root.querySelector(sel);
   const state = { am: null, pm: null };   // 選択中の行動種別（nullは「なし」）
+  const SLOT_LABEL = { am: '午前', pm: '午後' };
+  let freeSlot = '';                      // 休暇で入力不要なスロット（'午前'/'午後'）
 
   function fatal(text) {
     $('#loading').classList.add('hidden');
@@ -263,6 +286,29 @@
     el.className = cls || '';
   }
 
+  /** 承認済みの休暇を反映する。半休のスロットは入力欄を隠す */
+  function applyLeave(ctx) {
+    if (!ctx || !ctx.leave) return false;
+
+    if (ctx.leave === '全日休') {
+      $('#loading').classList.add('hidden');
+      $('#on-leave').classList.remove('hidden');
+      return true;               // フォームは表示しない
+    }
+
+    freeSlot = ctx.freeSlot || '';
+    for (const section of document.querySelectorAll('[data-slot]')) {
+      if (SLOT_LABEL[section.dataset.slot] !== freeSlot) continue;
+      section.classList.add('on-leave');
+      const note = $('.leave-note', section);
+      note.textContent = `${ctx.leave}のため入力は不要です`;
+      note.classList.remove('hidden');
+      $('label', section).classList.add('hidden');
+      select(section, null);     // 「なし」で確定
+    }
+    return false;
+  }
+
   async function submit() {
     const btn = $('#submit');
     setMsg('');
@@ -324,11 +370,31 @@
     }
 
     document.querySelectorAll('[data-slot]').forEach(buildChoices);
+
+    // 当日の休暇を取得する。取れなくても入力自体は続けられる
+    let ctx = null;
     try {
-      const profile = await liff.getProfile();
-      $('#who').textContent = `${profile.displayName} さん`;
+      const res = await fetch('/liff/report/context', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken: liff.getIDToken() }),
+      });
+      if (res.ok) ctx = await res.json();
     } catch (e) {
-      // 名前が取れなくても入力はできる（保存時はサーバー側で特定する）
+      // 取得失敗時は通常のフォームを出す
+    }
+
+    if (applyLeave(ctx)) return;   // 全日休なら入力画面を出さない
+
+    if (ctx && ctx.name) {
+      $('#who').textContent = `${ctx.name} さん`;
+    } else {
+      try {
+        const profile = await liff.getProfile();
+        $('#who').textContent = `${profile.displayName} さん`;
+      } catch (e) {
+        // 名前が取れなくても入力はできる（保存時はサーバー側で特定する）
+      }
     }
     $('#submit').onclick = submit;
     $('#loading').classList.add('hidden');
