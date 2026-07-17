@@ -123,6 +123,10 @@ JST = ZoneInfo('Asia/Tokyo')
 # 締切を過ぎても未入力者のシートへの自動書き込みは行わず、未提出のままとする。
 DEADLINE_NOTE = '入力は本日24時までです。'
 
+# 18:00の通知時点でまだ勤務中の場合の案内。
+# 通知の時刻に縛られず、実際に仕事が終わった時間に入力してもらう。
+OVERTIME_NOTE = '残業などでまだ仕事中の場合は、終わってから入力してください。'
+
 # postbackのaction名
 ACTION_MY_WEEKLY = 'my_weekly'      # 本人の週次まとめ
 
@@ -475,12 +479,20 @@ def create_reminder_flex_message() -> FlexMessage:
                 {
                     'type': 'text',
                     'text': '今日も一日お疲れ様でした。\n'
-                            '今日の日報を入力してください。\n'
+                            '仕事が終わったら、今日の日報を入力してください。\n'
                             '午前・午後をまとめて入力できます。',
                     'wrap': True,
                     'color': '#555555',
                     'size': 'sm',
                     'margin': 'xs',
+                },
+                {
+                    'type': 'text',
+                    'text': f'⏰ {DEADLINE_NOTE}\n{OVERTIME_NOTE}',
+                    'wrap': True,
+                    'color': '#C0392B',
+                    'size': 'xs',
+                    'margin': 'md',
                 },
                 {
                     'type': 'button',
@@ -697,6 +709,10 @@ def create_help_flex_message() -> FlexMessage:
                 body_text(
                     '午前・午後を1画面でまとめて入力できます。'
                     'どちらかがない日は「なし」を選んでください。'
+                ),
+                body_text(
+                    'お知らせは18:00に届きますが、その時間に入力しなくても'
+                    '大丈夫です。残業した日は、終わった時間に入力してください。'
                 ),
                 body_text(
                     f'⏰ {DEADLINE_NOTE}\n'
