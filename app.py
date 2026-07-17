@@ -420,16 +420,6 @@ def reply_text(reply_token: str, text: str):
         ))
 
 
-def push_text(user_id: str, text: str):
-    """テキストメッセージをプッシュ送信する（返信済みで応答トークンが使えない場合用）"""
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.push_message(PushMessageRequest(
-            to=user_id,
-            messages=[TextMessage(text=text)],
-        ))
-
-
 def reply_error(reply_token: str):
     """エラー時に汎用メッセージを返信する"""
     try:
@@ -776,41 +766,35 @@ def finalize_and_save(user_id: str, display_name: str):
     )
 
 
-def save_report_in_background(user_id: str, display_name: str, snap: dict):
-    """日報保存をバックグラウンドで実行する。
+def save_and_reply(reply_token: str, display_name: str, snap: dict, summary: str):
+    """日報を保存し、その結果を返信する。
 
-    LINEの3秒タイムアウト対策で、呼び出し元は先にサマリーを返信している。
-    そのため保存に失敗した場合、本人は提出できたと誤解したままになる。
-    失敗時はプッシュで本人に知らせ、入力内容もログに残す。
+    保存を待ってから返信するため、成功したと偽って伝えることがない。
+    /webhook は既に即時200を返しており（callback参照）、この処理自体が
+    バックグラウンドスレッドで動いているため、保存を待ってから返信しても
+    LINEの3秒タイムアウトには当たらない。
     """
-    def _run():
-        try:
-            save_report(
-                display_name    = display_name,
-                time_slot       = snap.get('time_slot', ''),
-                action          = snap.get('action', ''),
-                company         = snap.get('company', ''),
-                destination     = snap.get('destination', ''),
-                work_content    = snap.get('work_content', ''),
-                factory_content = snap.get('factory_content', ''),
-                memo            = snap.get('memo', ''),
-            )
-        except Exception:
-            # 入力内容をログに残す（シートに残らないため復旧の手がかりになる）
-            logger.error(
-                f'日報の保存に失敗: {display_name} / {snap}', exc_info=True
-            )
-            try:
-                push_text(
-                    user_id,
-                    '⚠️ 日報の保存に失敗しました。\n'
-                    'お手数ですが、もう一度「日報」から入力してください。\n'
-                    '繰り返し失敗する場合は管理者にご連絡ください。'
-                )
-            except Exception:
-                logger.error('保存失敗の通知にも失敗', exc_info=True)
+    try:
+        save_report(
+            display_name    = display_name,
+            time_slot       = snap.get('time_slot', ''),
+            action          = snap.get('action', ''),
+            company         = snap.get('company', ''),
+            destination     = snap.get('destination', ''),
+            work_content    = snap.get('work_content', ''),
+            factory_content = snap.get('factory_content', ''),
+            memo            = snap.get('memo', ''),
+        )
+    except Exception:
+        # 入力内容をログに残す（シートに残らないため復旧の手がかりになる）
+        logger.error(f'日報の保存に失敗: {display_name} / {snap}', exc_info=True)
+        reply_text(
+            reply_token,
+            '⚠️ 保存に失敗しました。もう一度送信してください。'
+        )
+        return
 
-    threading.Thread(target=_run, daemon=True).start()
+    reply_text(reply_token, summary)
 
 # ─────────────────────────────────────
 # レポート用ヘルパー
@@ -864,27 +848,26 @@ def get_all_users() -> list[dict]:
 
 def normalize_date(value) -> date | None:
     """日付の表記ゆれを吸収してdateオブジェクトに変換する。
-    '2026/07/16'、'2026/7/16'、'2026-07-16'、'7/16' などをすべて同じ日付として扱う。
-    年が省略されている場合は現在の年（JST）とみなす。
+    '2026/07/16'、'2026/7/16'、'2026-07-16' をすべて同じ日付として扱う。
+
+    年は必須。'7/16' のような年なしの値は解釈せずNoneを返す。
+    年を補うと、シートに残っている年なしの古い行が当日の日報として
+    誤ってヒットするため。save_report は必ず年付き（%Y/%m/%d）で保存する。
+
     日付として解釈できない場合はNoneを返す。"""
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
         return value
 
+    # 末尾の時刻などは無視し、先頭3つの数値を 年・月・日 として扱う
     nums = [int(n) for n in re.findall(r'\d+', str(value))]
-    if len(nums) < 2:
+    if len(nums) < 3:
         return None
 
-    # 先頭が32以上なら年付き（2026/7/16）、そうでなければ年省略（7/16）とみなす。
-    # 末尾の時刻などは無視する。
-    if nums[0] > 31:
-        if len(nums) < 3:
-            return None
-        year, month, day = nums[0], nums[1], nums[2]
-    else:
-        year = datetime.now(JST).year
-        month, day = nums[0], nums[1]
+    year, month, day = nums[0], nums[1], nums[2]
+    if not 1000 <= year <= 9999:   # 年なし（'7/16 09:30' 等）は解釈しない
+        return None
 
     try:
         return date(year, month, day)
@@ -1839,44 +1822,36 @@ def handle_message(event):
             # 「スキップ」の場合はメモなしで保存
             user_states[user_id]['memo'] = '' if text == 'スキップ' else text
             summary = build_summary(user_states[user_id], display_name)
-            reply_text(reply_token, summary)  # 先に返信（LINE 3秒タイムアウト対策）
             snap = dict(user_states[user_id])
-            snap_dname = display_name
             del user_states[user_id]
-            save_report_in_background(user_id, snap_dname, snap)
+            save_and_reply(reply_token, display_name, snap, summary)
             return
 
         # ──── 移動先の入力 ────
         if current_state == 'waiting_for_destination':
             user_states[user_id]['destination'] = text
             summary = build_summary(user_states[user_id], display_name)
-            reply_text(reply_token, summary)  # 先に返信（LINE 3秒タイムアウト対策）
             snap = dict(user_states[user_id])
-            snap_dname = display_name
             del user_states[user_id]
-            save_report_in_background(user_id, snap_dname, snap)
+            save_and_reply(reply_token, display_name, snap, summary)
             return
 
         # ──── 社内作業内容の入力 ────
         if current_state == 'waiting_for_work_content':
             user_states[user_id]['work_content'] = text
             summary = build_summary(user_states[user_id], display_name)
-            reply_text(reply_token, summary)  # 先に返信（LINE 3秒タイムアウト対策）
             snap = dict(user_states[user_id])
-            snap_dname = display_name
             del user_states[user_id]
-            save_report_in_background(user_id, snap_dname, snap)
+            save_and_reply(reply_token, display_name, snap, summary)
             return
 
         # ──── 工場対応内容の入力 ────
         if current_state == 'waiting_for_factory_content':
             user_states[user_id]['factory_content'] = text
             summary = build_summary(user_states[user_id], display_name)
-            reply_text(reply_token, summary)  # 先に返信（LINE 3秒タイムアウト対策）
             snap = dict(user_states[user_id])
-            snap_dname = display_name
             del user_states[user_id]
-            save_report_in_background(user_id, snap_dname, snap)
+            save_and_reply(reply_token, display_name, snap, summary)
             return
 
     except Exception as e:
