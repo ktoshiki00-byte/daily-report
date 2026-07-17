@@ -741,9 +741,10 @@ def create_help_flex_message() -> FlexMessage:
                 cmd_row('使い方', 'この説明を表示'),
                 {'type': 'separator', 'margin': 'md'},
                 section_header('休暇・有給', '#8E44AD'),
-                cmd_row('休暇申請',   '休暇の申請'),
+                cmd_row('休暇申請',   '休暇の申請（管理者が承認します）'),
                 cmd_row('有給残日数', '残日数を確認'),
                 cmd_row('申請履歴',   '直近5件を表示'),
+                cmd_row('有給一覧',   '全員の残日数（管理者のみ）'),
                 {'type': 'separator', 'margin': 'md'},
                 # ── 自動送信スケジュール ──
                 section_header('自動送信スケジュール', '#E67E22'),
@@ -1146,14 +1147,95 @@ def _get_user_id_by_name(name: str) -> str:
     return ''
 
 
+def _read_sheet_rows(sheet) -> list[dict]:
+    """シートを {列名: 値, '_row': 行番号} のリストで返す。
+
+    get_all_records() は空行で読み取りが止まり、それ以降の行が丸ごと消える。
+    行番号も返すため、更新対象の行を件数から逆算する必要がない。
+    """
+    all_values = sheet.get_all_values()
+    if len(all_values) < 2:
+        return []
+    headers = all_values[0]
+    rows = []
+    for idx, row in enumerate(all_values[1:], start=2):
+        if not any(str(c).strip() for c in row):
+            continue                      # 空行は飛ばす（止まらない）
+        d = {headers[i]: row[i] for i in range(len(headers)) if i < len(row)}
+        d['_row'] = idx
+        rows.append(d)
+    return rows
+
+
+def _to_int(value, default: int = 0) -> int:
+    """'3'、'3.0'、3.0、'' などを整数に変換する。変換できなければdefault"""
+    try:
+        return int(float(str(value).strip()))
+    except (ValueError, TypeError):
+        return default
+
+
 def _get_leave_balance(user_id: str) -> dict | None:
     """有給管理シートからユーザーの有給情報を取得する。未登録なら None を返す"""
-    sheet   = get_leave_balance_sheet()
-    records = sheet.get_all_records()
-    for i, r in enumerate(records):
+    for r in _read_sheet_rows(get_leave_balance_sheet()):
         if r.get('LINE_USER_ID') == user_id:
-            return {'row': i + 2, 'data': r}
+            return {'row': r['_row'], 'data': r}
     return None
+
+
+def _find_leave_balance_by_name(name: str) -> dict | None:
+    """有給管理シートを名前で検索する。表記ゆれは吸収する"""
+    target = normalize_name(name)
+    for r in _read_sheet_rows(get_leave_balance_sheet()):
+        if normalize_name(r.get('名前')) == target:
+            return {'row': r['_row'], 'data': r}
+    return None
+
+
+def _calc_leave_balance(name: str) -> dict:
+    """有給管理シートから付与日数・使用日数・残日数を読む。
+
+    シートの『残日数』列を正とする。承認時はこの値から申請日数を引くため、
+    繰越分や手動調整をそのまま反映できる（管理者がシートを直せばそれが使われる）。
+    残日数が空欄の場合のみ、入社日から算出した付与日数で補う。
+
+    戻り値: {'found', 'known', 'row', 'granted', 'used', 'remaining', 'problem'}
+      found : 有給管理シートに行があるか
+      known : 残日数を確定できたか（Falseなら承認時の減算はできない）
+      problem: 確定できた場合でも注意があれば入る
+    """
+    result = {'found': False, 'known': False, 'row': 0, 'granted': 0,
+              'used': 0, 'remaining': 0, 'problem': ''}
+
+    entry = _find_leave_balance_by_name(name)
+    if entry is None:
+        result['problem'] = '有給管理シートに登録がありません'
+        return result
+
+    result['found'] = True
+    result['row']   = entry['row']
+    d = entry['data']
+
+    result['used']    = _to_int(d.get('使用日数'))
+    result['granted'] = _to_int(d.get('付与日数'))
+
+    if str(d.get('残日数', '')).strip():
+        result['remaining'] = _to_int(d.get('残日数'))
+        result['known']     = True
+        return result
+
+    # 残日数が空欄。付与日数か入社日から補って初期値とする
+    if not str(d.get('付与日数', '')).strip():
+        hire_date = normalize_date(str(d.get('入社日', '')).strip())
+        if hire_date is None:
+            result['problem'] = '残日数・付与日数・入社日がいずれも未設定'
+            return result
+        result['granted'] = _calculate_leave_entitlement(hire_date)
+
+    result['remaining'] = result['granted'] - result['used']
+    result['known']     = True
+    result['problem']   = '残日数が空欄のため付与日数から算出'
+    return result
 
 
 def _submit_leave_application(
@@ -1170,6 +1252,75 @@ def _submit_leave_application(
                                      '申請中', '', ''])
 
 
+def _build_leave_balance_list() -> str:
+    """全員の有給残日数の一覧を組み立てる（管理者向け）。
+    有給管理シートに未登録の人や、入社日が未設定の人も分かるようにする。"""
+    entries = _read_sheet_rows(get_leave_balance_sheet())
+    users   = get_all_users()
+
+    lines = ['🏖 有給残日数の一覧', '']
+
+    if not entries:
+        lines.append('有給管理シートにデータがありません。')
+        lines.append('')
+        lines.append('シートに直接入力してください（1行1名）:')
+        lines.append('　名前 / LINE_USER_ID / 入社日 / 付与日数 / 使用日数 / 残日数')
+        lines.append('　※ 入社日（例 2024/04/01）を入れれば付与日数は自動計算されます')
+        return '\n'.join(lines)
+
+    problems = []
+    for e in entries:
+        name = str(e.get('名前', '')).strip()
+        if not name:
+            problems.append(f'{e["_row"]}行目: 名前が空欄')
+            continue
+        bal = _calc_leave_balance(name)
+        if not bal['known']:
+            lines.append(f'❓ {name}: 不明')
+            problems.append(f'{name}: {bal["problem"]}')
+            continue
+        mark = '⚠️' if bal['remaining'] <= 0 else '・'
+        lines.append(
+            f'{mark} {name}: 残 {bal["remaining"]}日'
+            f'（付与 {bal["granted"]} / 使用 {bal["used"]}）'
+        )
+        if bal['problem']:
+            problems.append(f'{name}: {bal["problem"]}')
+
+    # usersシートにいるのに有給管理シートに無い人
+    registered = {normalize_name(e.get('名前')) for e in entries}
+    missing    = [u['name'] for u in users
+                  if normalize_name(u['name']) not in registered]
+    if missing:
+        lines.append('')
+        lines.append('❌ 有給管理シートに未登録')
+        for name in missing:
+            lines.append(f'　・{name}')
+
+    if problems:
+        lines.append('')
+        lines.append('【要対応】')
+        for p in problems:
+            lines.append(f'　・{p}')
+        lines.append('')
+        lines.append('有給管理シートの「入社日」（例 2024/04/01）を入れれば'
+                     '付与日数は自動計算されます。')
+
+    return '\n'.join(lines)
+
+
+def _format_leave_period(start_date: str, end_date: str) -> str:
+    """休暇期間を短く表示する。1日なら '7/25'、複数日なら '7/25〜7/27'"""
+    start = normalize_date(start_date)
+    end   = normalize_date(end_date)
+    if start is None or end is None:
+        # 日付として読めない場合は元の文字列をそのまま見せる
+        return start_date if start_date == end_date else f'{start_date}〜{end_date}'
+    if start == end:
+        return f'{start.month}/{start.day}'
+    return f'{start.month}/{start.day}〜{end.month}/{end.day}'
+
+
 def _notify_admins_leave(
     display_name: str, leave_type: str,
     start_date: str, end_date: str, days: int, reason: str, row_num: int,
@@ -1183,9 +1334,19 @@ def _notify_admins_leave(
         f'休暇申請が届きました\n\n'
         f'申請者：{display_name}\n'
         f'種別：{leave_type}\n'
-        f'期間：{start_date}〜{end_date}（{days}日）\n'
+        f'期間：{_format_leave_period(start_date, end_date)}（{days}日）\n'
         f'理由：{reason}'
     )
+
+    # 有給は現在の残日数を添える。足りない場合はその場で分かるようにする
+    if leave_type == '有給':
+        bal = _calc_leave_balance(display_name)
+        if bal['problem']:
+            msg_text += f'\n\n残日数：不明（{bal["problem"]}）'
+        else:
+            msg_text += f'\n\n現在の残日数：{bal["remaining"]}日'
+            if bal['remaining'] < days:
+                msg_text += f'\n⚠️ 申請日数（{days}日）が残日数を超えています'
     quick_reply = QuickReply(items=[
         QuickReplyItem(action=PostbackAction(
             label='承認',
@@ -1235,37 +1396,46 @@ def _process_leave_decision(row_num: int, admin_id: str, approved: bool) -> str:
         admin_name = get_display_name(admin_id)
         now_str    = datetime.now(JST).strftime('%Y/%m/%d %H:%M')
 
+        # 先にステータスを確定させる。ここが書けた時点で二重処理は防がれる
         app_sheet.update_cell(row_num, 8,  new_status)
         app_sheet.update_cell(row_num, 9,  admin_name)
         app_sheet.update_cell(row_num, 10, now_str)
 
-        # 有給承認時は残日数を減算
+        period    = _format_leave_period(start_date, end_date)
+        admin_msg = f'{app_name}さんの申請を{new_status}しました。'
+        remaining_note = ''
+
+        # 有給の承認時のみ残日数を更新する（却下では減らさない）
         if approved and app_type == '有給' and app_days > 0:
-            bal_sheet   = get_leave_balance_sheet()
-            bal_records = bal_sheet.get_all_records()
-            for i, r in enumerate(bal_records):
-                if r.get('名前') == app_name:
-                    used      = int(float(str(r.get('使用日数', 0)))) + app_days
-                    remaining = int(float(str(r.get('残日数', 0)))) - app_days
-                    bal_sheet.update_cell(i + 2, 5, used)
-                    bal_sheet.update_cell(i + 2, 6, remaining)
-                    break
+            bal = _calc_leave_balance(app_name)
+            if not bal['known']:
+                logger.warning(
+                    f'有給残日数を更新できません: {app_name} / {bal["problem"]}'
+                )
+                admin_msg += f'\n⚠️ 残日数は更新できませんでした（{bal["problem"]}）'
+            else:
+                # シートの値から申請日数を引く（繰越や手動調整を保つ）
+                new_used      = bal['used'] + app_days
+                new_remaining = bal['remaining'] - app_days
+                bal_sheet = get_leave_balance_sheet()
+                bal_sheet.update_cell(bal['row'], 5, new_used)
+                bal_sheet.update_cell(bal['row'], 6, new_remaining)
+                remaining_note = f'\n残り{new_remaining}日です。'
+                admin_msg += f'\n{app_name}さんの残日数：{new_remaining}日'
+                if new_remaining < 0:
+                    admin_msg += '\n⚠️ 残日数がマイナスになっています'
 
         # 申請者に結果を通知
         applicant_id = _get_user_id_by_name(app_name)
         if applicant_id:
             if approved:
                 notify_text = (
-                    f'休暇申請が承認されました。\n'
-                    f'種別：{app_type}\n'
-                    f'期間：{start_date}〜{end_date}（{app_days}日）\n'
+                    f'{period}の{app_type}が承認されました。{remaining_note}\n'
                     f'承認者：{admin_name}'
                 )
             else:
                 notify_text = (
-                    f'休暇申請が却下されました。\n'
-                    f'種別：{app_type}\n'
-                    f'期間：{start_date}〜{end_date}\n'
+                    f'{period}の{app_type}が却下されました。\n'
                     f'担当者にご確認ください。'
                 )
             try:
@@ -1276,11 +1446,14 @@ def _process_leave_decision(row_num: int, admin_id: str, approved: bool) -> str:
                     ))
             except Exception as e:
                 logger.error(f'申請者への結果通知失敗 ({applicant_id}): {e}')
+        else:
+            logger.warning(f'申請者のユーザーIDが見つかりません: {app_name}')
+            admin_msg += '\n※ 本人への通知は送れませんでした'
 
-        return f'{app_name}さんの申請を{new_status}しました。'
+        return admin_msg
 
     except Exception as e:
-        logger.error(f'申請決裁処理エラー: {e}')
+        logger.error(f'申請決裁処理エラー: {e}', exc_info=True)
         return 'エラーが発生しました。もう一度お試しください。'
 
 
@@ -1933,58 +2106,60 @@ def handle_message(event):
             if not SHEETS_ENABLED:
                 reply_text(reply_token, 'スプレッドシートが未設定のため確認できません。')
                 return
-            balance = _get_leave_balance(user_id)
-            if balance is None:
+            display_name = get_display_name(user_id)
+            # 承認フローと同じ読み取りを使う（表示と減算がずれないようにする）
+            bal = _calc_leave_balance(display_name)
+            if not bal['found']:
                 reply_text(reply_token, '有給管理に登録されていません。管理者にご確認ください。')
                 return
-            d = balance['data']
-            hire_date_str = str(d.get('入社日', ''))
-            try:
-                hire_date = datetime.strptime(hire_date_str, '%Y/%m/%d').date()
-            except ValueError:
-                try:
-                    hire_date = datetime.strptime(hire_date_str, '%Y-%m-%d').date()
-                except ValueError:
-                    reply_text(reply_token, '入社日の形式が正しくありません。管理者にご確認ください。')
-                    return
-            granted = _calculate_leave_entitlement(hire_date)
-            display_name = get_display_name(user_id)
-            used = 0
-            try:
-                app_sheet = get_leave_application_sheet()
-                records   = app_sheet.get_all_records()
-                for r in records:
-                    if (r.get('名前') == display_name
-                            and r.get('申請種別') == '有給'
-                            and r.get('ステータス') == '承認'):
-                        used += int(float(str(r.get('日数', 0))))
-            except Exception as e:
-                logger.error(f'使用日数集計エラー: {e}')
-            remaining = max(0, granted - used)
-            today  = datetime.now(JST).date()
-            months = (today.year - hire_date.year) * 12 + (today.month - hire_date.month)
-            if today.day < hire_date.day:
-                months -= 1
-            grant_schedule = [6, 18, 30, 42, 54, 66, 78]
-            grant_days_map = {6:10, 18:11, 30:12, 42:14, 54:16, 66:18, 78:20}
+            if not bal['known']:
+                reply_text(
+                    reply_token,
+                    f'有給情報が未設定です。管理者にご確認ください。\n（{bal["problem"]}）'
+                )
+                return
+
             next_info = ''
-            for gm in grant_schedule:
-                if months < gm:
-                    next_date = datetime(
-                        hire_date.year + (hire_date.month + gm - 1) // 12,
-                        (hire_date.month + gm - 1) % 12 + 1,
-                        hire_date.day
-                    ).date()
-                    next_info = f'\n\n次回付与：{next_date.strftime("%Y/%m/%d")}\n（{grant_days_map[gm]}日付与予定）'
-                    break
+            entry     = _find_leave_balance_by_name(display_name)
+            hire_date = normalize_date(str(entry['data'].get('入社日', ''))) if entry else None
+            if hire_date:
+                today  = datetime.now(JST).date()
+                months = (today.year - hire_date.year) * 12 + (today.month - hire_date.month)
+                if today.day < hire_date.day:
+                    months -= 1
+                grant_schedule = [6, 18, 30, 42, 54, 66, 78]
+                grant_days_map = {6:10, 18:11, 30:12, 42:14, 54:16, 66:18, 78:20}
+                for gm in grant_schedule:
+                    if months < gm:
+                        next_date = datetime(
+                            hire_date.year + (hire_date.month + gm - 1) // 12,
+                            (hire_date.month + gm - 1) % 12 + 1,
+                            hire_date.day
+                        ).date()
+                        next_info = (
+                            f'\n\n次回付与：{next_date.strftime("%Y/%m/%d")}\n'
+                            f'（{grant_days_map[gm]}日付与予定）'
+                        )
+                        break
             reply_text(
                 reply_token,
                 f'{display_name}さんの有給情報\n\n'
-                f'付与日数：{granted}日\n'
-                f'使用日数：{used}日\n'
-                f'残日数：{remaining}日'
+                f'付与日数：{bal["granted"]}日\n'
+                f'使用日数：{bal["used"]}日\n'
+                f'残日数：{bal["remaining"]}日'
                 f'{next_info}'
             )
+            return
+
+        # ──── 有給一覧コマンド（管理者のみ） ────
+        if text == '有給一覧':
+            if not SHEETS_ENABLED:
+                reply_text(reply_token, 'スプレッドシートが未設定のため確認できません。')
+                return
+            if not is_admin(user_id):
+                reply_text(reply_token, '管理者のみ確認できます。')
+                return
+            reply_text(reply_token, _build_leave_balance_list())
             return
 
         # ──── 申請履歴コマンド ────
