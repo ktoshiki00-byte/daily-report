@@ -110,14 +110,29 @@ _spreadsheet_lock = threading.Lock()
 LINE_USER_ID = os.environ.get('LINE_USER_ID', '')
 
 # タイムゾーン（日本標準時）
+# サーバー（Render）はUTCで動くため、日付・時刻の判定は必ずJSTに変換して行う。
 JST = ZoneInfo('Asia/Tokyo')
 
 # ─────────────────────────────────────
 # 定数定義
 # ─────────────────────────────────────
 
+# 日報の締切。
+# 入力フォームは常に「送信した瞬間のJSTの日付」で保存するため（save_report参照）、
+# 24:00を過ぎた入力は自動的に翌日の日報になる。遡り入力の手段は用意していない。
+# 締切を過ぎても未入力者のシートへの自動書き込みは行わず、未提出のままとする。
+DEADLINE_NOTE = '入力は本日24時までです。'
+
 # postbackのaction名
 ACTION_MY_WEEKLY = 'my_weekly'      # 本人の週次まとめ
+
+# 登録完了メッセージ（スプレッドシート連携の有無にかかわらず同じ文面を使う）
+REGISTERED_MESSAGE_TEMPLATE = (
+    '{name}さんを登録しました！\n'
+    '平日18時にお知らせを送ります。\n'
+    '「日報を入力」を押すとフォームが開き、午前・午後をまとめて入力できます。\n'
+    + DEADLINE_NOTE
+)
 
 # 日報ボタンの定義（label: 表示名, value: 記録値）
 ACTIONS = [
@@ -317,44 +332,32 @@ def register_user(user_id: str, display_name: str) -> str:
     スプレッドシート連携が無効な場合はログのみ出力する。"""
     if not SHEETS_ENABLED:
         logger.info(f'[SHEETS無効] ユーザー登録: {display_name} ({user_id})')
-        return (
-            f'{display_name}さんを登録しました！\n'
-            '毎日11時55分と18時00分に日報リマインダーを送ります\n'
-            'ボタンをタップして1〜2分で入力できます。'
-        )
+        return REGISTERED_MESSAGE_TEMPLATE.format(name=display_name)
 
     spreadsheet = get_spreadsheet()
     users_sheet = get_or_create_sheet(
         spreadsheet, 'users', ['LINE表示名', 'ユーザーID', '登録日']
     )
-    records = users_sheet.get_all_records()
 
-    if any(r.get('ユーザーID') == user_id for r in records):
+    # 重複チェックは get_all_users() を使う。get_all_records() は空行で止まるため、
+    # 空行より下に登録済みの本人がいると二重登録になる
+    if any(u['id'] == user_id for u in get_all_users()):
         return f'{display_name}さんはすでに登録済みです！'
 
     today = datetime.now(JST).strftime('%Y/%m/%d')
     append_row_safely(users_sheet, [display_name, user_id, today])
-    return (
-        f'{display_name}さんを登録しました！\n'
-        '平日18時にお知らせを送ります。\n'
-        '「日報を入力」を押すとフォームが開き、'
-        '午前・午後をまとめて入力できます。'
-    )
+    return REGISTERED_MESSAGE_TEMPLATE.format(name=display_name)
 
 
 def get_all_user_ids() -> list[str]:
     """登録済み全ユーザーのIDリストを取得する。
-    スプレッドシート連携が無効な場合は空リストを返す。"""
-    if not SHEETS_ENABLED:
-        logger.info('[SHEETS無効] ユーザーIDの取得をスキップ')
-        return []
+    スプレッドシート連携が無効な場合は空リストを返す。
 
-    spreadsheet = get_spreadsheet()
-    users_sheet = get_or_create_sheet(
-        spreadsheet, 'users', ['LINE表示名', 'ユーザーID']
-    )
-    records = users_sheet.get_all_records()
-    return [r['ユーザーID'] for r in records if r.get('ユーザーID')]
+    usersシートの読み取りは get_all_users() に統一する。
+    get_all_records() は空行で止まるため、usersシートの途中に空行があると
+    それ以降のユーザーに通知が届かなくなる。
+    """
+    return [u['id'] for u in get_all_users()]
 
 
 def save_inquiry(display_name: str, message: str, auto_reply: str):
@@ -696,10 +699,22 @@ def create_help_flex_message() -> FlexMessage:
                     'どちらかがない日は「なし」を選んでください。'
                 ),
                 body_text(
+                    f'⏰ {DEADLINE_NOTE}\n'
+                    '24時を過ぎると翌日の日報になります。'
+                    '前の日にさかのぼっての入力はできません。',
+                    color='#C0392B',
+                ),
+                body_text(
                     '※ 初回はプロフィールへのアクセス許可を求められます。'
                     '「許可する」を押してください。',
                     color='#E67E22',
                 ),
+                {'type': 'separator', 'margin': 'md'},
+                # ── 新しいスタッフの登録 ──
+                section_header('新しく入った方へ', '#16A085'),
+                body_text('① 日報ボットを友だち追加する'),
+                body_text('② 「登録する」を押す（または「登録」と送信）'),
+                body_text('③ 「登録しました！」が返れば完了。翌日から18時にお知らせが届きます'),
                 {'type': 'separator', 'margin': 'md'},
                 # ── 基本コマンド ──
                 section_header('コマンド', '#2980B9'),
@@ -1595,6 +1610,8 @@ def daily_report_to_admin():
             f'提出: {len(submitted_users)}/{len(all_users)}名 '
             f'({round(len(submitted_users)/len(all_users)*100)}%)'
         )
+        # 締切前の集計であることを明示する（この時点の未提出は確定ではない）
+        lines.append(DEADLINE_NOTE)
 
         report_text = '\n'.join(lines)
         _push_to_admins(report_text)
