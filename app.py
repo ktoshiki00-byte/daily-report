@@ -229,6 +229,31 @@ def get_or_create_sheet(spreadsheet, sheet_name: str, headers: list = None):
     return sheet
 
 
+def append_row_safely(sheet, row: list) -> int:
+    """シート末尾に1行追記し、実際に書き込まれた行番号を返す。
+
+    insert_data_option を明示する。gspread の既定は未指定で、その場合
+    Sheets API 側の既定 OVERWRITE が使われる。OVERWRITE は書き込み先を
+    「表範囲の次の行」と判定するため、途中に空行があると表範囲の検出結果
+    次第で既存行を上書きし得る。INSERT_ROWS なら常に行を挿入する。
+
+    行番号はAPIの応答（updatedRange）から取得する。get_all_records()の
+    件数から計算すると空行で件数が途切れ、別の行を指してしまう。
+    書き込み自体はAPI側で原子的に行われるため、同時保存でも競合しない。
+    """
+    resp = sheet.append_row(
+        row,
+        table_range='A1',
+        insert_data_option='INSERT_ROWS',
+    )
+    updated_range = resp.get('updates', {}).get('updatedRange', '')
+    m = re.search(r'![A-Z]+(\d+)', updated_range)
+    if not m:
+        logger.warning(f'書き込み行を特定できません: updatedRange={updated_range!r}')
+        return -1
+    return int(m.group(1))
+
+
 def save_report(
     display_name: str,
     time_slot: str,
@@ -270,8 +295,11 @@ def save_report(
         ['日付', '時間', 'ユーザー名', '午前or午後', '行動種別',
          '訪問先会社名', '移動先', '作業内容', '工場対応内容', '自由メモ']
     )
-    sheet.append_row(row)
-    logger.info(f'日報保存完了: {display_name} / {time_slot} / {action}')
+    written_row = append_row_safely(sheet, row)
+    logger.info(
+        f'日報保存完了: {display_name} / {time_slot} / {action} '
+        f'（{written_row}行目に書き込み）'
+    )
 
 
 def register_user(user_id: str, display_name: str) -> str:
@@ -295,7 +323,7 @@ def register_user(user_id: str, display_name: str) -> str:
         return f'{display_name}さんはすでに登録済みです！'
 
     today = datetime.now(JST).strftime('%Y/%m/%d')
-    users_sheet.append_row([display_name, user_id, today])
+    append_row_safely(users_sheet, [display_name, user_id, today])
     return (
         f'{display_name}さんを登録しました！\n'
         '毎日11時55分と18時00分に日報リマインダーを送ります\n'
@@ -336,7 +364,7 @@ def save_inquiry(display_name: str, message: str, auto_reply: str):
         spreadsheet, '問い合わせ',
         ['日時', '名前', 'メッセージ内容', '自動返信内容']
     )
-    sheet.append_row(row)
+    append_row_safely(sheet, row)
     logger.info(f'問い合わせ記録完了: {display_name} / {message[:30]}')
 
 
@@ -388,6 +416,16 @@ def reply_text(reply_token: str, text: str):
         line_bot_api = MessagingApi(api_client)
         line_bot_api.reply_message(ReplyMessageRequest(
             reply_token=reply_token,
+            messages=[TextMessage(text=text)],
+        ))
+
+
+def push_text(user_id: str, text: str):
+    """テキストメッセージをプッシュ送信する（返信済みで応答トークンが使えない場合用）"""
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        line_bot_api.push_message(PushMessageRequest(
+            to=user_id,
             messages=[TextMessage(text=text)],
         ))
 
@@ -737,6 +775,43 @@ def finalize_and_save(user_id: str, display_name: str):
         memo               = s.get('memo', ''),
     )
 
+
+def save_report_in_background(user_id: str, display_name: str, snap: dict):
+    """日報保存をバックグラウンドで実行する。
+
+    LINEの3秒タイムアウト対策で、呼び出し元は先にサマリーを返信している。
+    そのため保存に失敗した場合、本人は提出できたと誤解したままになる。
+    失敗時はプッシュで本人に知らせ、入力内容もログに残す。
+    """
+    def _run():
+        try:
+            save_report(
+                display_name    = display_name,
+                time_slot       = snap.get('time_slot', ''),
+                action          = snap.get('action', ''),
+                company         = snap.get('company', ''),
+                destination     = snap.get('destination', ''),
+                work_content    = snap.get('work_content', ''),
+                factory_content = snap.get('factory_content', ''),
+                memo            = snap.get('memo', ''),
+            )
+        except Exception:
+            # 入力内容をログに残す（シートに残らないため復旧の手がかりになる）
+            logger.error(
+                f'日報の保存に失敗: {display_name} / {snap}', exc_info=True
+            )
+            try:
+                push_text(
+                    user_id,
+                    '⚠️ 日報の保存に失敗しました。\n'
+                    'お手数ですが、もう一度「日報」から入力してください。\n'
+                    '繰り返し失敗する場合は管理者にご連絡ください。'
+                )
+            except Exception:
+                logger.error('保存失敗の通知にも失敗', exc_info=True)
+
+    threading.Thread(target=_run, daemon=True).start()
+
 # ─────────────────────────────────────
 # レポート用ヘルパー
 # ─────────────────────────────────────
@@ -971,12 +1046,13 @@ def _submit_leave_application(
     start_date: str, end_date: str, days: int, reason: str,
 ) -> int:
     """休暇申請シートに申請行を追加し、挿入した行番号を返す"""
-    sheet            = get_leave_application_sheet()
-    rows_before      = len(sheet.get_all_records())
-    now_str          = datetime.now(JST).strftime('%Y/%m/%d %H:%M')
-    sheet.append_row([now_str, display_name, leave_type,
-                      start_date, end_date, days, reason, '申請中', '', ''])
-    return rows_before + 2  # 行1=ヘッダー、データは行2〜
+    sheet   = get_leave_application_sheet()
+    now_str = datetime.now(JST).strftime('%Y/%m/%d %H:%M')
+    # 実際に書き込んだ行番号を使う。get_all_records()の件数から計算すると
+    # 空行で件数が途切れ、承認時に別の行を書き換えてしまう
+    return append_row_safely(sheet, [now_str, display_name, leave_type,
+                                     start_date, end_date, days, reason,
+                                     '申請中', '', ''])
 
 
 def _notify_admins_leave(
@@ -1299,6 +1375,17 @@ def daily_report_to_admin():
 
         # 当日の全日報データを取得
         records = get_reports_by_date_range([date_str])
+
+        # 当日分として拾った行を、シート上の生の日付つきでログに残す。
+        # 年なしの日付（例: '7/16'）は現在の年として解釈されるため、
+        # 過去の行を当日分として誤って拾っていないか確認できるようにする
+        logger.info(
+            f'日次レポート対象={date_str} / 該当 {len(records)} 件: '
+            + str([
+                (r.get('日付'), r.get('ユーザー名'), r.get('時間'))
+                for r in records
+            ])
+        )
 
         # 登録ユーザー一覧を取得
         all_users = get_all_users()
@@ -1756,15 +1843,7 @@ def handle_message(event):
             snap = dict(user_states[user_id])
             snap_dname = display_name
             del user_states[user_id]
-            def _bg_save_memo(snap=snap, dname=snap_dname):
-                try:
-                    save_report(display_name=dname, time_slot=snap.get('time_slot',''),
-                        action=snap.get('action',''), company=snap.get('company',''),
-                        destination=snap.get('destination',''), work_content=snap.get('work_content',''),
-                        factory_content=snap.get('factory_content',''), memo=snap.get('memo',''))
-                except Exception as e:
-                    logger.error(f'バックグラウンド保存エラー: {e}')
-            threading.Thread(target=_bg_save_memo, daemon=True).start()
+            save_report_in_background(user_id, snap_dname, snap)
             return
 
         # ──── 移動先の入力 ────
@@ -1775,15 +1854,7 @@ def handle_message(event):
             snap = dict(user_states[user_id])
             snap_dname = display_name
             del user_states[user_id]
-            def _bg_save_dest(snap=snap, dname=snap_dname):
-                try:
-                    save_report(display_name=dname, time_slot=snap.get('time_slot',''),
-                        action=snap.get('action',''), company=snap.get('company',''),
-                        destination=snap.get('destination',''), work_content=snap.get('work_content',''),
-                        factory_content=snap.get('factory_content',''), memo=snap.get('memo',''))
-                except Exception as e:
-                    logger.error(f'バックグラウンド保存エラー: {e}')
-            threading.Thread(target=_bg_save_dest, daemon=True).start()
+            save_report_in_background(user_id, snap_dname, snap)
             return
 
         # ──── 社内作業内容の入力 ────
@@ -1794,15 +1865,7 @@ def handle_message(event):
             snap = dict(user_states[user_id])
             snap_dname = display_name
             del user_states[user_id]
-            def _bg_save_work(snap=snap, dname=snap_dname):
-                try:
-                    save_report(display_name=dname, time_slot=snap.get('time_slot',''),
-                        action=snap.get('action',''), company=snap.get('company',''),
-                        destination=snap.get('destination',''), work_content=snap.get('work_content',''),
-                        factory_content=snap.get('factory_content',''), memo=snap.get('memo',''))
-                except Exception as e:
-                    logger.error(f'バックグラウンド保存エラー: {e}')
-            threading.Thread(target=_bg_save_work, daemon=True).start()
+            save_report_in_background(user_id, snap_dname, snap)
             return
 
         # ──── 工場対応内容の入力 ────
@@ -1813,15 +1876,7 @@ def handle_message(event):
             snap = dict(user_states[user_id])
             snap_dname = display_name
             del user_states[user_id]
-            def _bg_save_factory(snap=snap, dname=snap_dname):
-                try:
-                    save_report(display_name=dname, time_slot=snap.get('time_slot',''),
-                        action=snap.get('action',''), company=snap.get('company',''),
-                        destination=snap.get('destination',''), work_content=snap.get('work_content',''),
-                        factory_content=snap.get('factory_content',''), memo=snap.get('memo',''))
-                except Exception as e:
-                    logger.error(f'バックグラウンド保存エラー: {e}')
-            threading.Thread(target=_bg_save_factory, daemon=True).start()
+            save_report_in_background(user_id, snap_dname, snap)
             return
 
     except Exception as e:
