@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>日報入力</title>
+<style>
+  :root {
+    --bg: #f2f4f7;
+    --card: #ffffff;
+    --text: #1a1a1a;
+    --sub: #666;
+    --line: #d8dce3;
+    --am: #ff8c00;
+    --pm: #1565c0;
+    --ok: #06c755;
+    --ng: #d32f2f;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0;
+    padding: 0 0 96px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans",
+                 "Noto Sans JP", sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+  }
+  header {
+    background: var(--card);
+    padding: 16px;
+    border-bottom: 1px solid var(--line);
+    position: sticky;
+    top: 0;
+    z-index: 5;
+  }
+  header h1 { margin: 0; font-size: 18px; }
+  header p { margin: 4px 0 0; font-size: 13px; color: var(--sub); }
+  .card {
+    background: var(--card);
+    margin: 12px;
+    padding: 16px;
+    border-radius: 12px;
+  }
+  .card > h2 {
+    margin: 0 0 12px;
+    font-size: 16px;
+    padding-left: 10px;
+    border-left: 4px solid var(--line);
+  }
+  .card.am > h2 { border-left-color: var(--am); }
+  .card.pm > h2 { border-left-color: var(--pm); }
+  label { display: block; margin: 14px 0 6px; font-size: 14px; color: var(--sub); }
+  /* 行動種別のボタン群。指で押しやすいサイズにする */
+  .choices { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .choices button {
+    min-height: 52px;
+    padding: 8px;
+    font-size: 15px;
+    font-family: inherit;
+    background: #fff;
+    color: var(--text);
+    border: 2px solid var(--line);
+    border-radius: 10px;
+    cursor: pointer;
+  }
+  .choices button.selected {
+    color: #fff;
+    border-color: transparent;
+    font-weight: bold;
+  }
+  .am .choices button.selected { background: var(--am); }
+  .pm .choices button.selected { background: var(--pm); }
+  .choices button.none { grid-column: 1 / -1; color: var(--sub); }
+  .choices button.none.selected { background: #555; color: #fff; }
+  input[type="text"], textarea {
+    width: 100%;
+    padding: 14px;
+    font-size: 16px;      /* 16px未満だとiOSで自動ズームする */
+    font-family: inherit;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: #fff;
+  }
+  textarea { min-height: 88px; resize: vertical; }
+  .hidden { display: none; }
+  footer {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    padding: 12px 12px calc(12px + env(safe-area-inset-bottom));
+    background: var(--card);
+    border-top: 1px solid var(--line);
+  }
+  #submit {
+    width: 100%;
+    min-height: 56px;
+    font-size: 17px;
+    font-weight: bold;
+    font-family: inherit;
+    color: #fff;
+    background: var(--ok);
+    border: 0;
+    border-radius: 12px;
+    cursor: pointer;
+  }
+  #submit:disabled { background: #b9bec7; }
+  #msg { margin: 0 0 8px; font-size: 14px; text-align: center; }
+  #msg.ng { color: var(--ng); }
+  #msg.ok { color: var(--ok); font-weight: bold; }
+  /* 完了画面 */
+  #done { padding: 64px 24px; text-align: center; }
+  #done .mark { font-size: 56px; }
+  #done h2 { margin: 12px 0 4px; }
+  #done p { color: var(--sub); font-size: 14px; }
+</style>
+</head>
+<body>
+
+<div id="loading" class="card">読み込み中...</div>
+
+<div id="fatal" class="card hidden"></div>
+
+<div id="app" class="hidden">
+  <header>
+    <h1>今日の日報</h1>
+    <p id="who"></p>
+  </header>
+
+  <section class="card am" data-slot="am">
+    <h2>午前</h2>
+    <label>行動種別</label>
+    <div class="choices"></div>
+    <div class="place hidden">
+      <label class="place-label"></label>
+      <input type="text" class="place-input" autocomplete="off">
+    </div>
+    <div class="content hidden">
+      <label class="content-label"></label>
+      <input type="text" class="content-input" autocomplete="off">
+    </div>
+  </section>
+
+  <section class="card pm" data-slot="pm">
+    <h2>午後</h2>
+    <label>行動種別</label>
+    <div class="choices"></div>
+    <div class="place hidden">
+      <label class="place-label"></label>
+      <input type="text" class="place-input" autocomplete="off">
+    </div>
+    <div class="content hidden">
+      <label class="content-label"></label>
+      <input type="text" class="content-input" autocomplete="off">
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>自由メモ</h2>
+    <textarea id="memo" placeholder="任意（午前・午後の両方に記録されます）"></textarea>
+  </section>
+
+  <footer>
+    <p id="msg"></p>
+    <button id="submit" type="button">送信する</button>
+  </footer>
+</div>
+
+<div id="done" class="hidden">
+  <div class="mark">✅</div>
+  <h2>記録しました</h2>
+  <p>この画面は自動で閉じます</p>
+</div>
+
+<script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+<script>
+  const LIFF_ID       = {{ liff_id | tojson }};
+  const LIFF_ENABLED  = {{ liff_enabled | tojson }};
+  const ACTIONS       = {{ actions | tojson }};
+  const PLACE_FIELDS  = {{ place_fields | tojson }};
+  const CONTENT_FIELDS = {{ content_fields | tojson }};
+
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const state = { am: null, pm: null };   // 選択中の行動種別（nullは「なし」）
+
+  function fatal(text) {
+    $('#loading').classList.add('hidden');
+    const el = $('#fatal');
+    el.textContent = text;
+    el.classList.remove('hidden');
+  }
+
+  /** 午前・午後それぞれの行動種別ボタンを組み立てる */
+  function buildChoices(section) {
+    const slot = section.dataset.slot;
+    const box  = $('.choices', section);
+
+    ACTIONS.forEach(action => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = action;
+      btn.onclick = () => select(section, action);
+      box.appendChild(btn);
+    });
+
+    const none = document.createElement('button');
+    none.type = 'button';
+    none.className = 'none';
+    none.textContent = 'なし';
+    none.onclick = () => select(section, null);
+    box.appendChild(none);
+
+    select(section, null);   // 初期状態は「なし」
+  }
+
+  /** 行動種別を選び、その種別に必要な入力欄だけを表示する */
+  function select(section, action) {
+    const slot = section.dataset.slot;
+    state[slot] = action;
+
+    [...$('.choices', section).children].forEach(btn => {
+      const isNone = btn.classList.contains('none');
+      const picked = isNone ? action === null : btn.textContent === action;
+      btn.classList.toggle('selected', picked);
+    });
+
+    const placeBox   = $('.place', section);
+    const contentBox = $('.content', section);
+
+    if (action === null) {
+      placeBox.classList.add('hidden');
+      contentBox.classList.add('hidden');
+      return;
+    }
+
+    const place = PLACE_FIELDS[action];
+    if (place && place.key) {
+      $('.place-label', section).textContent = place.label;
+      placeBox.classList.remove('hidden');
+    } else {
+      placeBox.classList.add('hidden');
+      $('.place-input', section).value = '';
+    }
+
+    const content = CONTENT_FIELDS[action];
+    $('.content-label', section).textContent = content.label;
+    contentBox.classList.remove('hidden');
+  }
+
+  function collect(section) {
+    const slot = section.dataset.slot;
+    if (state[slot] === null) return { action: '' };
+    return {
+      action:  state[slot],
+      place:   $('.place-input', section).value,
+      content: $('.content-input', section).value,
+    };
+  }
+
+  function setMsg(text, cls) {
+    const el = $('#msg');
+    el.textContent = text;
+    el.className = cls || '';
+  }
+
+  async function submit() {
+    const btn = $('#submit');
+    setMsg('');
+
+    if (state.am === null && state.pm === null) {
+      setMsg('午前・午後のどちらかは入力してください。', 'ng');
+      return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = '送信中...';
+    try {
+      const res = await fetch('/liff/report/submit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          idToken: liff.getIDToken(),
+          am: collect($('[data-slot="am"]')),
+          pm: collect($('[data-slot="pm"]')),
+          memo: $('#memo').value,
+        }),
+      });
+      const body = await res.json().catch(() => ({}));
+
+      if (res.ok && body.ok) {
+        $('#app').classList.add('hidden');
+        $('#done').classList.remove('hidden');
+        setTimeout(() => { if (liff.isInClient()) liff.closeWindow(); }, 1200);
+        return;
+      }
+      // 失敗。入力内容は残したまま、もう一度送信できるようにする
+      setMsg(body.message || '保存に失敗しました。もう一度送信してください。', 'ng');
+    } catch (e) {
+      setMsg('通信に失敗しました。電波の良い場所でもう一度お試しください。', 'ng');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '送信する';
+    }
+  }
+
+  async function main() {
+    if (!LIFF_ENABLED) {
+      fatal('日報入力フォームが未設定です。管理者にご連絡ください。');
+      return;
+    }
+    try {
+      await liff.init({ liffId: LIFF_ID });
+    } catch (e) {
+      fatal('フォームの初期化に失敗しました。もう一度開いてください。');
+      return;
+    }
+    if (!liff.isLoggedIn()) {
+      liff.login();
+      return;
+    }
+    if (!liff.getIDToken()) {
+      fatal('ログイン情報を取得できませんでした。LINEアプリから開き直してください。');
+      return;
+    }
+
+    document.querySelectorAll('[data-slot]').forEach(buildChoices);
+    try {
+      const profile = await liff.getProfile();
+      $('#who').textContent = `${profile.displayName} さん`;
+    } catch (e) {
+      // 名前が取れなくても入力はできる（保存時はサーバー側で特定する）
+    }
+    $('#submit').onclick = submit;
+    $('#loading').classList.add('hidden');
+    $('#app').classList.remove('hidden');
+  }
+
+  main();
+</script>
+</body>
+</html>

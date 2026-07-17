@@ -15,8 +15,9 @@ from functools import lru_cache
 from zoneinfo import ZoneInfo
 
 import gspread
+import requests
 from google.oauth2.service_account import Credentials
-from flask import Flask, request, abort, jsonify
+from flask import Flask, request, abort, jsonify, render_template
 from dotenv import load_dotenv
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -68,6 +69,24 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ['LINE_CHANNEL_ACCESS_TOKEN']
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler       = WebhookHandler(LINE_CHANNEL_SECRET)
 
+# LIFF設定（日報入力フォーム）
+# LIFF_ID              : LINEログインチャネルのLIFFタブで発行されるID
+# LINE_LOGIN_CHANNEL_ID: そのLINEログインチャネルのチャネルID。
+#                        IDトークン検証時の client_id（aud）に使う。
+# ※ LINEログインチャネルは、Botと同じプロバイダーに作ること。
+#    プロバイダーが違うとユーザーIDが別値になり、本人を特定できない。
+LIFF_ID               = os.environ.get('LIFF_ID', '')
+LINE_LOGIN_CHANNEL_ID = os.environ.get('LINE_LOGIN_CHANNEL_ID', '')
+LIFF_ENABLED          = bool(LIFF_ID and LINE_LOGIN_CHANNEL_ID)
+if not LIFF_ENABLED:
+    logger.warning(
+        'LIFF_ID または LINE_LOGIN_CHANNEL_ID が未設定です。'
+        '日報入力フォームは利用できません。'
+    )
+
+# IDトークン検証エンドポイント
+LINE_VERIFY_URL = 'https://api.line.me/oauth2/v2.1/verify'
+
 # Google Sheets設定
 # 環境変数が未設定の場合はスプレッドシート連携を無効化してログのみ出力する
 GOOGLE_SHEET_ID   = os.environ.get('GOOGLE_SHEET_ID', '')
@@ -97,10 +116,8 @@ JST = ZoneInfo('Asia/Tokyo')
 # 定数定義
 # ─────────────────────────────────────
 
-# postbackのaction名（行動種別の値と衝突しない名前にする）
-ACTION_START_REPORT = 'start_report'   # 日報入力フローの開始
-ACTION_SKIP_SLOT    = 'skip_slot'      # 午前 or 午後をスキップ
-ACTION_MY_WEEKLY    = 'my_weekly'      # 本人の週次まとめ
+# postbackのaction名
+ACTION_MY_WEEKLY = 'my_weekly'      # 本人の週次まとめ
 
 # 日報ボタンの定義（label: 表示名, value: 記録値）
 ACTIONS = [
@@ -141,43 +158,30 @@ INQUIRY_KEYWORDS: list[tuple[list[str], str]] = [
 # どのキーワードにもマッチしない場合のデフォルト返信
 INQUIRY_DEFAULT_REPLY = INQUIRY_DEFAULT_REPLY = ''
 
-# 各アクションに対応する「入力待ち状態」と「質問文」の定義
-#
-# フロー別:
-#   商談 / メーカー訪問 / 展示会・イベント
-#     → waiting_for_company（訪問先会社名）
-#     → waiting_for_memo（自由メモ、スキップ可）
-#     → 保存
-#
-#   移動・外出
-#     → waiting_for_destination（移動先・目的地）
-#     → 保存
-#
-#   社内作業
-#     → waiting_for_work_content（作業内容）
-#     → 保存
-#
-#   工場対応
-#     → waiting_for_factory_content（対応内容）
-#     → 保存
-
-# アクション → 最初の入力待ち状態へのマッピング
-ACTION_FIRST_STATE = {
-    '商談':         'waiting_for_company',
-    'メーカー訪問': 'waiting_for_company',
-    '展示会・イベント': 'waiting_for_company',
-    '移動・外出':   'waiting_for_destination',
-    '社内作業':     'waiting_for_work_content',
-    '工場対応':     'waiting_for_factory_content',
+# 日報の入力はLIFFフォーム（/liff/report）で行う。
+# 行動種別ごとに、訪問先/移動先の欄をどのラベルで表示するかの定義。
+# valueは日報シートの列に対応する:
+#   company     → 訪問先会社名
+#   destination → 移動先
+#   （なし）    → 詳細欄は作業内容のみ
+ACTION_PLACE_FIELD = {
+    '商談':             ('company',     '訪問先'),
+    'メーカー訪問':     ('company',     '訪問先'),
+    '展示会・イベント': ('company',     '会場・イベント名'),
+    '移動・外出':       ('destination', '移動先・目的地'),
+    '社内作業':         (None,          ''),
+    '工場対応':         (None,          ''),
 }
 
-# 入力待ち状態 → ユーザーへの質問文
-STATE_QUESTION = {
-    'waiting_for_company':        '商談内容を入力してください（例：〇〇社訪問、社内商談、オンライン商談など）',
-    'waiting_for_memo':           '自由メモがあれば入力してください\n（スキップする場合は「スキップ」と送信）',
-    'waiting_for_destination':    '移動先・目的地を入力してください',
-    'waiting_for_work_content':   '作業内容を入力してください',
-    'waiting_for_factory_content':'対応内容を入力してください',
+# 行動種別ごとの「作業内容」欄のラベル。
+# 工場対応は工場対応内容列、それ以外は作業内容列に入る。
+ACTION_CONTENT_FIELD = {
+    '商談':             ('work_content',    '商談内容'),
+    'メーカー訪問':     ('work_content',    '訪問内容'),
+    '展示会・イベント': ('work_content',    '内容'),
+    '移動・外出':       ('work_content',    '内容'),
+    '社内作業':         ('work_content',    '作業内容'),
+    '工場対応':         ('factory_content', '対応内容'),
 }
 
 # ─────────────────────────────────────
@@ -185,25 +189,18 @@ STATE_QUESTION = {
 # ─────────────────────────────────────
 # Render.com無料プランはシングルワーカーのためインメモリで問題なし
 #
-# 1回のフローで午前・午後の両方を入力する。
-# 午前が終わった時点でその内容を rows に退避し、続けて午後を入力する。
-# 最後に rows の各要素を1行ずつ日報シートに保存する（既存の1行=1スロット形式）。
+# 日報の入力はLIFFフォームに移行したため、ここで扱うのは休暇申請フローのみ。
 #
 # 形式:
 # {
 #   user_id: {
-#     'state':           str,   # 現在の入力待ち状態
-#     'time_slot':       str,   # 入力中のスロット '午前' or '午後'
-#     'rows':            list,  # 入力済みスロットのリスト（save_reportに渡す形）
-#     'action':          str,   # 入力中スロットのアクション名
-#     'company':         str,   # 訪問先会社名
-#     'destination':     str,   # 移動先
-#     'work_content':    str,   # 作業内容
-#     'factory_content': str,   # 工場対応内容
-#     'memo':            str,   # 自由メモ
+#     'state':       str,   # 現在の入力待ち状態（例: 'leave_reason'）
+#     'leave_type':  str,
+#     'leave_start': str,
+#     'leave_end':   str,
+#     'leave_days':  int,
 #   }
 # }
-# 開始ボタンを押すたびに初期化されるため、途中で放置してもやり直せる。
 user_states: dict = {}
 _display_name_cache: dict = {}
 _DISPLAY_NAME_TTL = 3600
@@ -474,7 +471,7 @@ def create_reminder_flex_message() -> FlexMessage:
                     'type': 'text',
                     'text': '今日も一日お疲れ様でした。\n'
                             '今日の日報を入力してください。\n'
-                            '午前・午後の順に伺います。',
+                            '午前・午後をまとめて入力できます。',
                     'wrap': True,
                     'color': '#555555',
                     'size': 'sm',
@@ -483,10 +480,9 @@ def create_reminder_flex_message() -> FlexMessage:
                 {
                     'type': 'button',
                     'action': {
-                        'type': 'postback',
+                        'type': 'uri',
                         'label': '日報を入力',
-                        'data': f'action={ACTION_START_REPORT}',
-                        'displayText': '日報を入力',
+                        'uri': liff_url(),
                     },
                     'style': 'primary',
                     'margin': 'md',
@@ -510,102 +506,6 @@ def create_reminder_flex_message() -> FlexMessage:
 
     return FlexMessage(
         alt_text='今日の日報を入力してください',
-        contents=FlexContainer.from_dict(flex_dict),
-    )
-
-
-def create_action_flex_message(time_slot: str, note: str = '') -> FlexMessage:
-    """行動種別を選ぶFlex Messageを作成する。
-    noteを渡すとボタンの上に案内文を表示する。"""
-    if time_slot == '午前':
-        header_color = '#FF8C00'      # オレンジ（午前）
-    else:
-        header_color = '#1565C0'      # ブルー（午後）
-
-    # 訪問系アクション（company入力あり）→ primary、それ以外 → secondary
-    visit_actions = {'商談', 'メーカー訪問', '展示会・イベント'}
-    buttons = []
-    for action in ACTIONS:
-        style = 'primary' if action['value'] in visit_actions else 'secondary'
-        buttons.append({
-            'type': 'button',
-            'action': {
-                'type': 'postback',
-                'label': action['label'],
-                'data': f"action={action['value']}&time_slot={time_slot}",
-                'displayText': action['label'],
-            },
-            'style': style,
-            'margin': 'sm',
-            'height': 'sm',
-        })
-
-    # スキップボタン
-    buttons.append({
-        'type': 'button',
-        'action': {
-            'type': 'postback',
-            'label': f'{time_slot}をスキップ',
-            'data': f'action={ACTION_SKIP_SLOT}&time_slot={time_slot}',
-            'displayText': f'{time_slot}をスキップ',
-        },
-        'style': 'link',
-        'margin': 'sm',
-        'height': 'sm',
-    })
-
-    body_texts = []
-    if note:
-        body_texts.append({
-            'type': 'text',
-            'text': note,
-            'wrap': True,
-            'color': '#D32F2F',
-            'size': 'sm',
-            'weight': 'bold',
-            'margin': 'xs',
-        })
-    body_texts.append({
-        'type': 'text',
-        'text': f'{time_slot}の活動を選んでください',
-        'wrap': True,
-        'color': '#555555',
-        'size': 'sm',
-        'margin': 'xs',
-    })
-
-    flex_dict = {
-        'type': 'bubble',
-        'size': 'mega',
-        'header': {
-            'type': 'box',
-            'layout': 'vertical',
-            'backgroundColor': header_color,
-            'paddingAll': '15px',
-            'contents': [
-                {
-                    'type': 'text',
-                    'text': f'{time_slot}の日報入力',
-                    'weight': 'bold',
-                    'color': '#ffffff',
-                    'size': 'lg',
-                }
-            ],
-        },
-        'body': {
-            'type': 'box',
-            'layout': 'vertical',
-            'spacing': 'sm',
-            'paddingAll': '13px',
-            'contents': [
-                *body_texts,
-                *buttons,
-            ],
-        },
-    }
-
-    return FlexMessage(
-        alt_text=f'{time_slot}の活動を選んでください',
         contents=FlexContainer.from_dict(flex_dict),
     )
 
@@ -804,6 +704,23 @@ def create_help_flex_message() -> FlexMessage:
     )
 
 
+def send_my_weekly_to_all(all_users: list[dict]):
+    """各スタッフに、その人自身の週次まとめを個別にプッシュ送信する。
+    1人分の送信に失敗しても他の人への送信は続ける。"""
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        for user in all_users:
+            try:
+                text = build_my_weekly_report_text(user['name'])
+                api.push_message(PushMessageRequest(
+                    to=user['id'],
+                    messages=[TextMessage(text=text)],
+                ))
+            except Exception as e:
+                logger.error(f'週次まとめの送信失敗 ({user.get("name")}): {e}')
+    logger.info(f'週次まとめを個別送信: {len(all_users)}名')
+
+
 def send_reminder_to_all():
     """登録済み全ユーザーに日報リマインダーをプッシュ送信する"""
     try:
@@ -833,103 +750,35 @@ def send_reminder_to_all():
 # サマリーテキスト生成
 # ─────────────────────────────────────
 
-def build_summary(rows: list[dict], display_name: str) -> str:
-    """記録完了時のサマリー文字列を生成する（午前・午後をまとめて表示）"""
-    lines = [
-        '記録しました！',
-        '━━━━━━━━━━━',
-        f'{display_name}',
-    ]
-    for row in rows:
-        lines.append('')
-        lines.append(f'【{row["time_slot"]}】{row["action"]}')
-        if row.get('company'):
-            lines.append(f'訪問先: {row["company"]}')
-        if row.get('destination'):
-            lines.append(f'移動先: {row["destination"]}')
-        if row.get('work_content'):
-            lines.append(f'作業内容: {row["work_content"]}')
-        if row.get('factory_content'):
-            lines.append(f'対応内容: {row["factory_content"]}')
-        if row.get('memo'):
-            lines.append(f'メモ: {row["memo"]}')
+class SaveReportError(Exception):
+    """日報の保存に失敗した。savedはそれまでに保存できた件数。"""
 
-    recorded = {row['time_slot'] for row in rows}
-    skipped  = [slot for slot in ('午前', '午後') if slot not in recorded]
-    if skipped:
-        lines.append('')
-        lines.append(f'（{"・".join(skipped)}はスキップ）')
-    return '\n'.join(lines)
+    def __init__(self, saved: int):
+        super().__init__(f'{saved}件保存後に失敗')
+        self.saved = saved
 
 
-def save_and_reply(reply_token: str, display_name: str,
-                   rows: list[dict], summary: str):
-    """日報を保存し、その結果を返信する。
-
-    保存を待ってから返信するため、成功したと偽って伝えることがない。
-    /webhook は既に即時200を返しており（callback参照）、この処理自体が
-    バックグラウンドスレッドで動いているため、保存を待ってから返信しても
-    LINEの3秒タイムアウトには当たらない。
+def save_report_rows(display_name: str, rows: list[dict]) -> int:
+    """日報の各行を保存し、保存できた件数を返す。
+    途中で失敗した場合は、それまでに保存した件数を添えて SaveReportError を送出する。
 
     rowsは午前・午後それぞれのスロットで、1件が日報シートの1行になる。
+    LIFFフォーム（/liff/report/submit）から呼ばれる。
     """
     saved = 0
     try:
         for row in rows:
             save_report(display_name=display_name, **row)
             saved += 1
-    except Exception:
+    except Exception as e:
         # 入力内容をログに残す（シートに残らないため復旧の手がかりになる）
         logger.error(
             f'日報の保存に失敗: {display_name} / {saved}/{len(rows)}件保存済み / '
             f'{rows}',
             exc_info=True
         )
-        if saved:
-            # 一部だけ保存された。やり直すと重複するため、その旨を伝える
-            reply_text(
-                reply_token,
-                '⚠️ 保存に失敗しました。もう一度送信してください。\n'
-                f'（{saved}件は記録済みのため、重複したら管理者にご連絡ください）'
-            )
-        else:
-            reply_text(
-                reply_token,
-                '⚠️ 保存に失敗しました。もう一度送信してください。'
-            )
-        return
-
-    reply_text(reply_token, summary)
-
-
-# ─────────────────────────────────────
-# 日報入力フロー制御（午前 → 午後 → 保存）
-# ─────────────────────────────────────
-
-def start_report_flow(user_id: str, reply_token: str, note: str = ''):
-    """日報入力フローを最初（午前の行動種別選択）から開始する。
-    既存の入力途中の状態は破棄されるため、放置後に押し直せばやり直せる。"""
-    user_states[user_id] = {
-        'state':           'waiting_for_action',
-        'time_slot':       '午前',
-        'rows':            [],
-        'action':          '',
-        'company':         '',
-        'destination':     '',
-        'work_content':    '',
-        'factory_content': '',
-        'memo':            '',
-    }
-    reply_action_flex(reply_token, '午前', note)
-
-
-def reply_action_flex(reply_token: str, time_slot: str, note: str = ''):
-    """行動種別の選択ボタンを返信する"""
-    with ApiClient(configuration) as api_client:
-        MessagingApi(api_client).reply_message(ReplyMessageRequest(
-            reply_token=reply_token,
-            messages=[create_action_flex_message(time_slot, note)],
-        ))
+        raise SaveReportError(saved) from e
+    return saved
 
 
 def reply_my_weekly_report(user_id: str, reply_token: str):
@@ -942,68 +791,81 @@ def reply_my_weekly_report(user_id: str, reply_token: str):
     reply_text(reply_token, build_my_weekly_report_text(display_name))
 
 
-def _is_current_slot(user_id: str, time_slot: str) -> bool:
-    """押されたボタンが、いま入力中のスロットのものかを判定する。
-    古い通知のボタンを押した場合に、午前の内容を午後として記録しないための確認。"""
-    state = user_states.get(user_id)
-    if state is None:
-        return False
-    return state['time_slot'] == time_slot
+# ─────────────────────────────────────
+# LIFF（日報入力フォーム）
+# ─────────────────────────────────────
+
+def liff_url() -> str:
+    """LIFFフォームのURLを返す"""
+    return f'https://liff.line.me/{LIFF_ID}'
 
 
-def _clear_slot_fields(state: dict):
-    """入力中スロットの作業用フィールドを初期化する"""
-    state['action'] = ''
-    for key in ('company', 'destination', 'work_content',
-                'factory_content', 'memo'):
-        state[key] = ''
-
-
-def _advance_slot(user_id: str, reply_token: str, display_name: str):
-    """午前が終わったら午後へ進み、午後が終わったら保存して完了する"""
-    state = user_states[user_id]
-    if state['time_slot'] == '午前':
-        state['time_slot'] = '午後'
-        state['state']     = 'waiting_for_action'
-        _clear_slot_fields(state)
-        reply_action_flex(reply_token, '午後')
+def reply_report_form_link(reply_token: str):
+    """日報入力フォームへのリンクを返信する"""
+    if not LIFF_ENABLED:
+        reply_text(reply_token, '日報入力フォームが未設定です。管理者にご連絡ください。')
         return
-    finish_report_flow(user_id, reply_token, display_name)
+    reply_text(reply_token, f'こちらから日報を入力してください。\n{liff_url()}')
 
 
-def complete_slot(user_id: str, reply_token: str, display_name: str):
-    """入力中スロットの内容を確定し、次へ進む"""
-    state = user_states[user_id]
-    state['rows'].append({
-        'time_slot':       state['time_slot'],
-        'action':          state['action'],
-        'company':         state.get('company', ''),
-        'destination':     state.get('destination', ''),
-        'work_content':    state.get('work_content', ''),
-        'factory_content': state.get('factory_content', ''),
-        'memo':            state.get('memo', ''),
-    })
-    _advance_slot(user_id, reply_token, display_name)
+def verify_id_token(id_token: str) -> dict | None:
+    """LIFFのIDトークンをLINEのAPIで検証し、ペイロードを返す。
+    検証に失敗した場合はNoneを返す。
 
-
-def skip_slot(user_id: str, reply_token: str, display_name: str):
-    """入力中スロットを記録せずに次へ進む"""
-    _advance_slot(user_id, reply_token, display_name)
-
-
-def finish_report_flow(user_id: str, reply_token: str, display_name: str):
-    """入力済みの内容を保存して完了する。
-    午前・午後の両方がスキップされた場合は、最低1つの入力を促してやり直す。"""
-    rows = user_states[user_id]['rows']
-    if not rows:
-        start_report_flow(
-            user_id, reply_token,
-            note='午前・午後のどちらかは入力してください。'
+    改ざんされたトークンで他人になりすませないよう、必ずサーバー側で検証する。
+    client_idにはLIFFが属するLINEログインチャネルのチャネルIDを指定する。
+    """
+    try:
+        resp = requests.post(
+            LINE_VERIFY_URL,
+            data={'id_token': id_token, 'client_id': LINE_LOGIN_CHANNEL_ID},
+            timeout=10,
         )
-        return
-    summary = build_summary(rows, display_name)
-    del user_states[user_id]
-    save_and_reply(reply_token, display_name, rows, summary)
+    except Exception:
+        logger.error('IDトークン検証のリクエストに失敗', exc_info=True)
+        return None
+
+    if resp.status_code != 200:
+        logger.warning(f'IDトークン検証に失敗: {resp.status_code} {resp.text[:200]}')
+        return None
+
+    payload = resp.json()
+    # 念のため発行先チャネルを確認する（検証APIも確認するが二重に守る）
+    if str(payload.get('aud')) != str(LINE_LOGIN_CHANNEL_ID):
+        logger.warning(f'IDトークンのaudが不一致: {payload.get("aud")!r}')
+        return None
+    return payload
+
+
+def _build_slot_row(time_slot: str, form: dict, memo: str) -> dict | None:
+    """フォームの1スロット分の入力から、日報シート1行分のデータを作る。
+    行動種別が未選択（「なし」）の場合はNoneを返す。"""
+    action = (form.get('action') or '').strip()
+    if not action:
+        return None
+    if action not in ACTION_PLACE_FIELD:
+        raise ValueError(f'不正な行動種別: {action}')
+
+    row = {
+        'time_slot':       time_slot,
+        'action':          action,
+        'company':         '',
+        'destination':     '',
+        'work_content':    '',
+        'factory_content': '',
+        'memo':            memo,
+    }
+
+    # 訪問先 or 移動先（行動種別によってどちらの列に入れるかが決まる）
+    place_key, _ = ACTION_PLACE_FIELD[action]
+    if place_key:
+        row[place_key] = (form.get('place') or '').strip()
+
+    # 作業内容 or 工場対応内容
+    content_key, _ = ACTION_CONTENT_FIELD[action]
+    row[content_key] = (form.get('content') or '').strip()
+
+    return row
 
 
 # ─────────────────────────────────────
@@ -1539,6 +1401,91 @@ def callback():
     return 'OK', 200
 
 
+@app.route('/liff/report', methods=['GET'])
+def liff_report_form():
+    """日報入力フォーム（LIFFアプリ）を返す。
+    LINE Developersコンソールで、このURLをLIFFのエンドポイントURLに設定する。"""
+    return render_template(
+        'liff_report.html',
+        liff_id=LIFF_ID,
+        liff_enabled=LIFF_ENABLED,
+        actions=[a['value'] for a in ACTIONS],
+        place_fields={k: {'key': v[0], 'label': v[1]}
+                      for k, v in ACTION_PLACE_FIELD.items()},
+        content_fields={k: {'key': v[0], 'label': v[1]}
+                        for k, v in ACTION_CONTENT_FIELD.items()},
+    )
+
+
+@app.route('/liff/report/submit', methods=['POST'])
+def liff_report_submit():
+    """日報入力フォームからの送信を受け取り、日報シートに保存する。
+    ユーザーはLIFFのIDトークンで特定する（クライアントの申告は信用しない）。"""
+    if not LIFF_ENABLED:
+        return jsonify({'ok': False, 'message': 'フォームが未設定です。管理者にご連絡ください。'}), 503
+
+    data     = request.get_json(silent=True) or {}
+    id_token = data.get('idToken') or ''
+    if not id_token:
+        return jsonify({'ok': False, 'message': 'ログイン情報が取得できませんでした。'}), 401
+
+    payload = verify_id_token(id_token)
+    if not payload or not payload.get('sub'):
+        return jsonify({'ok': False, 'message': 'ログイン情報を確認できませんでした。開き直してください。'}), 401
+
+    user_id = payload['sub']
+
+    # 名前は既存の保存処理と同じ経路で取得し、シート上の表記と揃える。
+    # 取得できない場合はIDトークンの名前を使う
+    try:
+        display_name = get_display_name(user_id)
+    except Exception:
+        display_name = payload.get('name', '')
+    if not display_name:
+        logger.error(f'表示名を取得できません: {user_id}')
+        return jsonify({'ok': False, 'message': 'ユーザー情報を取得できませんでした。'}), 500
+
+    memo = (data.get('memo') or '').strip()
+    try:
+        rows = [
+            row for row in (
+                _build_slot_row('午前', data.get('am') or {}, memo),
+                _build_slot_row('午後', data.get('pm') or {}, memo),
+            ) if row is not None
+        ]
+    except ValueError as e:
+        logger.warning(f'不正な入力: {e}')
+        return jsonify({'ok': False, 'message': '入力内容が不正です。開き直してください。'}), 400
+
+    if not rows:
+        return jsonify({
+            'ok': False,
+            'message': '午前・午後のどちらかは入力してください。',
+        }), 400
+
+    if not SHEETS_ENABLED:
+        logger.info(f'[SHEETS無効] LIFF日報: {display_name} / {rows}')
+        return jsonify({'ok': True, 'message': '記録しました'})
+
+    try:
+        save_report_rows(display_name, rows)
+    except SaveReportError as e:
+        if e.saved:
+            # 一部だけ保存された。やり直すと重複するため、その旨を伝える
+            return jsonify({
+                'ok': False,
+                'message': f'保存に失敗しました。もう一度送信してください。'
+                           f'（{e.saved}件は記録済みのため、重複したら管理者にご連絡ください）',
+            }), 500
+        return jsonify({
+            'ok': False,
+            'message': '保存に失敗しました。もう一度送信してください。',
+        }), 500
+
+    logger.info(f'LIFFから日報保存: {display_name} / {len(rows)}件')
+    return jsonify({'ok': True, 'message': '記録しました'})
+
+
 @app.route('/reminder', methods=['GET', 'POST'])
 def reminder():
     """平日18:00 JSTにcron-job.orgから呼ばれるエンドポイント。
@@ -1624,14 +1571,15 @@ def daily_report_to_admin():
         _push_to_admins(report_text)
         logger.info('日次レポート送信完了')
 
-        # 金曜は続けて週次レポートも送る
+        # 金曜は続けて週次まとめも送る（管理者に全員分、各スタッフに自分の分）
         weekly_sent = False
         if today.weekday() == 4:
             weekly_text = build_weekly_report_text()
             if weekly_text:
                 _push_to_admins(weekly_text)
                 weekly_sent = True
-                logger.info('週次レポート送信完了')
+                logger.info('週次レポート送信完了（管理者）')
+            send_my_weekly_to_all(all_users)
 
         return jsonify({
             'status': 'ok',
@@ -1831,7 +1779,7 @@ def handle_message(event):
         # ──── 日報入力コマンド ────
         # 午前 → 午後 の順に入力する。送るたびに最初からやり直せる
         if text == '日報入力':
-            start_report_flow(user_id, reply_token)
+            reply_report_form_link(reply_token)
             return
 
         # ──── 週次まとめコマンド（本人の分のみ） ────
@@ -2057,38 +2005,6 @@ def handle_message(event):
                 f'理由：{reason}\n\n'
                 f'承認後にLINEでお知らせします。'
             )
-            return
-
-        # ──── 訪問先会社名の入力 ────
-        if current_state == 'waiting_for_company':
-            user_states[user_id]['company'] = text
-            user_states[user_id]['state']   = 'waiting_for_memo'
-            reply_text(reply_token, STATE_QUESTION['waiting_for_memo'])
-            return
-
-        # ──── 自由メモの入力（スキップ可） ────
-        if current_state == 'waiting_for_memo':
-            # 「スキップ」の場合はメモなしで確定
-            user_states[user_id]['memo'] = '' if text == 'スキップ' else text
-            complete_slot(user_id, reply_token, display_name)
-            return
-
-        # ──── 移動先の入力 ────
-        if current_state == 'waiting_for_destination':
-            user_states[user_id]['destination'] = text
-            complete_slot(user_id, reply_token, display_name)
-            return
-
-        # ──── 社内作業内容の入力 ────
-        if current_state == 'waiting_for_work_content':
-            user_states[user_id]['work_content'] = text
-            complete_slot(user_id, reply_token, display_name)
-            return
-
-        # ──── 工場対応内容の入力 ────
-        if current_state == 'waiting_for_factory_content':
-            user_states[user_id]['factory_content'] = text
-            complete_slot(user_id, reply_token, display_name)
             return
 
     except Exception as e:
@@ -2517,43 +2433,13 @@ def handle_postback(event):
             reply_text(reply_token, result)
             return
 
-        # ──── 日報入力：開始（18:00の通知ボタン / 「日報入力」コマンド） ────
-        # 押すたびに最初からやり直せる
-        if action == ACTION_START_REPORT:
-            start_report_flow(user_id, reply_token)
-            return
-
         # ──── 週次まとめ（本人の分のみ） ────
         if action == ACTION_MY_WEEKLY:
             reply_my_weekly_report(user_id, reply_token)
             return
 
-        # ──── 日報入力：午前 or 午後をスキップ ────
-        if action == ACTION_SKIP_SLOT:
-            if not _is_current_slot(user_id, time_slot):
-                # 状態が消えている、または古いボタンを押した場合はやり直す
-                start_report_flow(user_id, reply_token)
-                return
-            skip_slot(user_id, reply_token, get_display_name(user_id))
-            return
-
-        # ──── 日報入力：行動種別の選択 ────
-        first_state = ACTION_FIRST_STATE.get(action)
-        if not first_state:
-            logger.warning(f'未定義のアクション: {action}')
-            reply_text(reply_token, '少し待ってからもう一度お試しください')
-            return
-
-        if not _is_current_slot(user_id, time_slot):
-            # 状態が消えている、または古いボタンを押した場合はやり直す
-            start_report_flow(user_id, reply_token)
-            return
-
-        # 入力中スロットのアクションを確定し、最初の質問へ
-        state = user_states[user_id]
-        state['action'] = action
-        state['state']  = first_state
-        reply_text(reply_token, STATE_QUESTION[first_state])
+        logger.warning(f'未定義のアクション: {action}')
+        reply_text(reply_token, '少し待ってからもう一度お試しください')
 
     except Exception as e:
         logger.error(f'ポストバック処理エラー: {e}')
