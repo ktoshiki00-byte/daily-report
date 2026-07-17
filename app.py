@@ -1874,9 +1874,20 @@ def liff_report_submit():
 
 
 @app.route('/reminder', methods=['GET', 'POST'])
+@app.route('/afternoon', methods=['GET', 'POST'])
 def reminder():
     """平日18:00 JSTにcron-job.orgから呼ばれるエンドポイント。
-    全ユーザーに日報入力の通知を1回だけ送る（午前・午後をまとめて入力する）。"""
+    全ユーザーに日報入力の通知を1回だけ送る（午前・午後をまとめて入力する）。
+
+    /afternoon は改名前の旧URL。cron-job.org に旧ジョブが残っていた場合に
+    通知が404で消えるのを防ぐため受け付けている。どちらで呼ばれたかログに
+    残すので、/afternoon の警告が出なくなれば旧ジョブは消えたと判断してよい。
+    """
+    if request.path == '/afternoon':
+        logger.warning(
+            '旧URL /afternoon が呼ばれた。'
+            'cron-job.org のジョブのURLを /reminder に変更すること'
+        )
     logger.info('日報リマインダー送信開始')
     send_reminder_to_all()
     return jsonify({'status': 'ok', 'message': '日報リマインダーを送信しました'})

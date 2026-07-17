@@ -18,10 +18,13 @@ cron-job.org 側のタイムゾーンを Asia/Tokyo に設定すること。
 サーバー（Render）はUTCで動くが、コード内の時刻判定は JST に変換済みのため、
 cron側をJSTにしておけば表記どおりの時刻で動作する。
 
-旧エンドポイント（削除済み。cron-job.org のジョブも削除すること）:
-  /morning   平日 11:55 JST  → 通知を18:00の1回に集約したため廃止
-  /afternoon 平日 18:00 JST  → /reminder に改名
-  /weekly    金曜 18:15 JST  → /report に統合（金曜のみ送信）
+旧エンドポイント（cron-job.org のジョブは /reminder・/report に直すこと）:
+  /morning   平日 11:55 JST  → 通知を18:00の1回に集約したため廃止（404）
+  /afternoon 平日 18:00 JST  → /reminder に改名。旧ジョブ救済のため
+                               /reminder のエイリアスとして今も受け付ける。
+                               呼ばれると警告ログを出すので、Renderのログに
+                               その警告が出ていれば旧ジョブが残っている。
+  /weekly    金曜 18:15 JST  → /report に統合（金曜のみ送信）（404）
 
 このファイルは将来的にスケジューラーが必要になった場合のために残している。
 """
