@@ -153,7 +153,8 @@ ACTION_SHORT = {
 INQUIRY_KEYWORDS: list[tuple[list[str], str]] = [
     (['休暇', '有給'],  '休暇・有給申請は上長に口頭またはLINEで事前連絡してください。'),
     (['遅刻', '早退'],  '遅刻・早退の場合は出勤前に上長へLINEで連絡してください。'),
-    (['日報', '提出'],  '日報はこのLINEBotに毎日送信してください。'),
+    (['日報', '提出'],  '日報は「日報入力」と送信するとフォームが開きます。\n'
+                        '18:00に届くお知らせのボタンからも開けます。'),
 ]
 # どのキーワードにもマッチしない場合のデフォルト返信
 INQUIRY_DEFAULT_REPLY = INQUIRY_DEFAULT_REPLY = ''
@@ -335,8 +336,9 @@ def register_user(user_id: str, display_name: str) -> str:
     append_row_safely(users_sheet, [display_name, user_id, today])
     return (
         f'{display_name}さんを登録しました！\n'
-        '毎日11時55分と18時00分に日報リマインダーを送ります\n'
-        'ボタンをタップして1〜2分で入力できます。'
+        '平日18時にお知らせを送ります。\n'
+        '「日報を入力」を押すとフォームが開き、'
+        '午前・午後をまとめて入力できます。'
     )
 
 
@@ -641,6 +643,16 @@ def create_help_flex_message() -> FlexMessage:
             ],
         }
 
+    def body_text(text: str, color: str = '#34495E', margin: str = 'sm') -> dict:
+        return {
+            'type': 'text',
+            'text': text,
+            'size': 'sm',
+            'color': color,
+            'wrap': True,
+            'margin': margin,
+        }
+
     flex_dict = {
         'type': 'bubble',
         'size': 'giga',
@@ -672,23 +684,40 @@ def create_help_flex_message() -> FlexMessage:
             'spacing': 'sm',
             'paddingAll': '16px',
             'contents': [
+                # ── 日報の入力 ──
+                section_header('日報の入力', '#E74C3C'),
+                body_text(
+                    '18:00に届くお知らせの「日報を入力」を押すと、'
+                    '入力フォームが開きます。'
+                ),
+                body_text('「日報入力」と送信してもフォームを開けます。'),
+                body_text(
+                    '午前・午後を1画面でまとめて入力できます。'
+                    'どちらかがない日は「なし」を選んでください。'
+                ),
+                body_text(
+                    '※ 初回はプロフィールへのアクセス許可を求められます。'
+                    '「許可する」を押してください。',
+                    color='#E67E22',
+                ),
+                {'type': 'separator', 'margin': 'md'},
                 # ── 基本コマンド ──
-                section_header('基本コマンド', '#2980B9'),
-                cmd_row('登録',   'ユーザー登録'),
+                section_header('コマンド', '#2980B9'),
+                cmd_row('日報入力',   '入力フォームを開く'),
+                cmd_row('週次まとめ', '今週の自分の日報を確認'),
                 cmd_row('確認',   '日報の照会\n1日分・月別・期間指定'),
-                cmd_row('使い方', 'この説明を表示'),{'type': 'separator', 'margin': 'md'},
+                cmd_row('登録',   'ユーザー登録'),
+                cmd_row('使い方', 'この説明を表示'),
+                {'type': 'separator', 'margin': 'md'},
                 section_header('休暇・有給', '#8E44AD'),
                 cmd_row('休暇申請',   '休暇の申請'),
                 cmd_row('有給残日数', '残日数を確認'),
                 cmd_row('申請履歴',   '直近5件を表示'),
                 {'type': 'separator', 'margin': 'md'},
-                section_header('日報', '#E74C3C'),
-                cmd_row('日報入力',   '午前・午後の日報を入力'),
-                cmd_row('週次まとめ', '今週の自分の日報を確認'),
-                {'type': 'separator', 'margin': 'md'},
                 # ── 自動送信スケジュール ──
                 section_header('自動送信スケジュール', '#E67E22'),
                 schedule_row('平日 18:00', '日報入力のお知らせ'),
+                schedule_row('金曜 19:30', '今週の自分の日報のまとめ'),
                 {'type': 'separator', 'margin': 'md'},
                 # ── 問い合わせ ──
                 section_header('問い合わせ', '#27AE60'),
