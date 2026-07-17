@@ -1563,9 +1563,12 @@ def daily_report_to_admin():
     logger.info('日次レポート送信開始')
 
     try:
-        today     = datetime.now(JST).date()
+        now       = datetime.now(JST)
+        today     = now.date()
         date_str  = today.strftime('%Y/%m/%d')
         date_label = f'{today.month}月{today.day}日'
+        # 集計した時刻をそのまま使う。cronの時刻を変えても表記が食い違わない
+        now_label = now.strftime('%H:%M')
 
         # 当日の全日報データを取得
         records = get_reports_by_date_range([date_str])
@@ -1609,24 +1612,24 @@ def daily_report_to_admin():
             lines.append(f'✅ {name}')
             lines.append(f'  {" / ".join(slot_texts)}')
 
-        # 未提出ユーザー
+        # 未入力ユーザー。締切（24時）前の集計のため「未提出」とは断定せず、
+        # 集計時点で未入力であることを示すにとどめる
         not_submitted = [
             u['name'] for u in all_users
             if normalize_name(u['name']) not in submitted_users
         ]
         if not_submitted:
             lines.append('')
-            lines.append('⚠️ 未提出')
+            lines.append(f'⚠️ {now_label}時点で未入力')
             for name in not_submitted:
                 lines.append(f'  ・{name}')
 
         # 統計
         lines.append('')
         lines.append(
-            f'提出: {len(submitted_users)}/{len(all_users)}名 '
+            f'入力済み: {len(submitted_users)}/{len(all_users)}名 '
             f'({round(len(submitted_users)/len(all_users)*100)}%)'
         )
-        # 締切前の集計であることを明示する（この時点の未提出は確定ではない）
         lines.append(DEADLINE_NOTE)
 
         report_text = '\n'.join(lines)
