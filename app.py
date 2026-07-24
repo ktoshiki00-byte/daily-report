@@ -1131,12 +1131,22 @@ def get_leave_balance_sheet():
     残日数 = 付与日数 − 指定日控除 − 申請消化 で自動計算する（承認時に書き戻す）。
     繰越分は付与日数に含める運用。
     """
+    _HEADERS = ['名前', 'LINE_USER_ID', '入社日', '付与日数', '指定日控除',
+                '申請消化', '残日数', '最終付与日']
     spreadsheet = get_spreadsheet()
-    return get_or_create_sheet(
-        spreadsheet, '有給管理',
-        ['名前', 'LINE_USER_ID', '入社日', '付与日数', '指定日控除',
-         '申請消化', '残日数', '最終付与日'],
-    )
+    sheet = get_or_create_sheet(spreadsheet, '有給管理', _HEADERS)
+    # 既存シートに列が不足している場合は末尾に追加する
+    try:
+        row0 = sheet.row_values(1)
+        missing = [h for h in _HEADERS if h not in row0]
+        if missing:
+            start = len(row0) + 1
+            for i, h in enumerate(missing):
+                sheet.update_cell(1, start + i, h)
+            logger.info(f'有給管理シート: 不足列を追加 → {missing}')
+    except Exception as e:
+        logger.error(f'有給管理シートのヘッダー確認エラー: {e}')
+    return sheet
 
 
 def get_leave_application_sheet():
