@@ -63,6 +63,11 @@ app = Flask(__name__)
 from routes.monthly import monthly_bp   # noqa: E402（循環インポート回避のためここで import）
 app.register_blueprint(monthly_bp)
 
+# 状態確認ページ（/status）と、定期実行・Webhookの記録
+from routes.status import status_bp, record_request   # noqa: E402
+app.register_blueprint(status_bp)
+app.after_request(record_request)
+
 # LINE Bot設定
 LINE_CHANNEL_SECRET      = os.environ['LINE_CHANNEL_SECRET']
 LINE_CHANNEL_ACCESS_TOKEN = os.environ['LINE_CHANNEL_ACCESS_TOKEN']
